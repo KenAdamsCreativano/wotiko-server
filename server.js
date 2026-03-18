@@ -171,9 +171,15 @@ app.post("/car-ready", async (req, res) => {
   }
 
   try {
-    // Send car_ready_otp template to guest — guest sees OTP on their WhatsApp
-    await sendTemplateMessage(phone, "car_ready_otp", [carNumber, otp]);
-    console.log(`✅ car_ready_otp sent to ${phone}`);
+    // Send OTP as plain text message — no template needed
+    // Works because guest already opened the 24hr window by tapping Retrieve Car
+    const otpMessage =
+      `Your car ${carNumber} is now at the main entrance and ready for pickup.\n\n` +
+      `Please show the code *${otp}* to the valet executive to collect your vehicle.\n\n` +
+      `We hope you enjoyed your experience at ${CONFIG.VENUE_NAME}!`;
+
+    await sendTextMessage(phone, otpMessage);
+    console.log(`✅ car_ready_otp (text) sent to ${phone} | OTP: ${otp}`);
 
     // Return options to driver app — driver sees 3 circles
     return res.json({ success: true, otp, options });
