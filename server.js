@@ -50,13 +50,15 @@ require('dotenv').config();
 
 // ── Firebase ───────────────────────────────────────────────────
 const admin = require('firebase-admin');
-let serviceAccount;
-if (process.env.GOOGLE_CREDENTIALS) {
-  serviceAccount = JSON.parse(process.env.GOOGLE_CREDENTIALS);
-} else {
-  serviceAccount = require('./serviceAccount.json');
-}
-admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
+
+// Uses .env variables directly — no serviceAccount.json file needed
+admin.initializeApp({
+  credential: admin.credential.cert({
+    projectId:   process.env.FIREBASE_PROJECT_ID,
+    clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+    privateKey:  process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n'),
+  }),
+});
 const db  = admin.firestore();
 const col = db.collection('parked_cars');
 console.log('✅ Firebase Admin initialized');
