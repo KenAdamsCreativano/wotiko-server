@@ -333,10 +333,9 @@ app.post('/car-ready', async (req, res) => {
   try {
     // MSG 4: Dynamic plain text OTP — cannot be a template (OTP changes each time)
     const otpMessage =
-      
-      `*${otp}* is your verification code.\n\n` +
-      `Please share this 2-digit code with the valet when collecting your car.\n\n`;
-      `Your car *${carNumber}* is now ready and waiting for you at the main entrance.\n\n` +
+      `Your car *${carNumber}* is now at the main entrance and ready for pickup.\n\n` +
+      `Please show the code *${otp}* to the valet executive to collect your vehicle.\n\n` +
+      `We hope you enjoyed your experience at ${VENUE_NAME}!`;
 
     await sendTextMessage(phone, otpMessage);
     console.log(`✅ MSG 4 (OTP plain text) → ${phone} | OTP: ${otp} | Car: ${carNumber}`);
@@ -558,10 +557,10 @@ async function sendTemplateMessage(to, templateName, bodyParams = []) {
 // ─────────────────────────────────────────────────────────────
 // START SERVER
 // ─────────────────────────────────────────────────────────────
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
+const PORT = 8000;
+app.listen(PORT, '0.0.0.0', () => {
   console.log(`\n🏨 ${VENUE_NAME} Backend + WhatsApp Bot`);
-  console.log(`🚀 Running on port ${PORT}`);
+  console.log(`🚀 Running on http://139.59.75.67:${PORT}`);
   console.log(`📲 POST /send-messages → send WhatsApp msg`);
   console.log(`🚗 POST /car-ready     → generate OTP + send to guest`);
   console.log(`✅ POST /verify-otp    → validate OTP + mark delivered`);
