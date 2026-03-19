@@ -6,7 +6,7 @@
   "scripts": {
     "start": "node server.js",
     "dev": "nodemon server.js",
-    "build" "nest build"
+    "build": "nest build"
   },
   "dependencies": {
     "axios": "^1.13.6",
