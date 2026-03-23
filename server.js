@@ -439,9 +439,12 @@ async function processIncomingMessage(body) {
 
     // ── Template quick-reply button (from parked_confirmation template) ──
     if (message.type === 'button') {
-      const text = message.button?.text?.toLowerCase();
+      const text = (message.button?.text || '').toLowerCase().trim();
       console.log(`🔘 Template button: "${text}"`);
-      if (text === 'retrieve car') await handleRetrieveCar(from);
+      // Match any retrieve button text variation
+      if (text.includes('retrieve') || text === 'retrieve car') {
+        await handleRetrieveCar(from);
+      }
       return;
     }
 
@@ -520,6 +523,13 @@ async function handleRetrieveCar(from) {
     });
     console.log(`✅ Firestore updated: retrieve_requested | Car: ${carNumber}`);
 
+    // Send FCM push notification to driver app
+    await sendFCMNotification(
+      'Car Retrieve Request 🚗',
+      `Vehicle ${carNumber} guest is waiting`,
+      { carNumber, type: 'retrieve_requested' }
+    );
+
   } catch (err) {
     console.error('❌ handleRetrieveCar error:', err.message);
   }
@@ -554,6 +564,48 @@ async function sendTemplateMessage(to, templateName, bodyParams = []) {
   console.log(`📤 Template: ${templateName} → ${to} | params:`, bodyParams);
   const res = await axios.post(WA_BASE, payload, { headers: WA_HEADERS() });
   return res.data;
+}
+
+// ─────────────────────────────────────────────────────────────
+// FCM — Send push notification to all driver devices
+// ─────────────────────────────────────────────────────────────
+async function sendFCMNotification(title, body, data = {}) {
+  try {
+    // Get all FCM tokens from Firestore
+    const tokensSnap = await db.collection('fcm_tokens').get();
+    if (tokensSnap.empty) {
+      console.log('⚠️ No FCM tokens found');
+      return;
+    }
+
+    const tokens = tokensSnap.docs.map(d => d.data().token).filter(Boolean);
+    if (tokens.length === 0) return;
+
+    const message = {
+      notification: { title, body },
+      data,
+      android: {
+        priority: 'high',
+        notification: {
+          channelId: 'wotiko_retrieve',
+          sound: 'car_lock_sms',
+          priority: 'max',
+          visibility: 'public',
+          defaultVibrateTimings: true,
+        },
+      },
+      apns: {
+        payload: { aps: { sound: 'car_lock_sms.mp3', badge: 1 } },
+        headers: { 'apns-priority': '10' },
+      },
+      tokens,
+    };
+
+    const response = await admin.messaging().sendEachForMulticast(message);
+    console.log(`✅ FCM sent to ${response.successCount}/${tokens.length} devices`);
+  } catch (err) {
+    console.error('❌ FCM error:', err.message);
+  }
 }
 
 // ─────────────────────────────────────────────────────────────
