@@ -51,7 +51,6 @@ require('dotenv').config();
 // ── Firebase ───────────────────────────────────────────────────
 const admin = require('firebase-admin');
 
-// Uses .env variables directly — no serviceAccount.json file needed
 admin.initializeApp({
   credential: admin.credential.cert({
     projectId:   process.env.FIREBASE_PROJECT_ID,
@@ -67,15 +66,14 @@ console.log('✅ Firebase Admin initialized');
 const WA_TOKEN    = process.env.WHATSAPP_ACCESS_TOKEN;
 const WA_PHONE_ID = process.env.WHATSAPP_PHONE_NUMBER_ID;
 
-// Validate WhatsApp config on startup
 if (!WA_TOKEN || !WA_PHONE_ID) {
   console.error('❌ CRITICAL: WHATSAPP_ACCESS_TOKEN or WHATSAPP_PHONE_NUMBER_ID missing from .env');
 } else {
   console.log(`✅ WhatsApp configured | Phone ID: ${WA_PHONE_ID}`);
 }
-const WA_VERIFY   = process.env.WEBHOOK_VERIFY_TOKEN || 'my-verify-token';
-const WA_BASE     = `https://graph.facebook.com/v19.0/${WA_PHONE_ID}/messages`;
-const WA_HEADERS  = () => ({
+const WA_VERIFY  = process.env.WEBHOOK_VERIFY_TOKEN || 'my-verify-token';
+const WA_BASE    = `https://graph.facebook.com/v19.0/${WA_PHONE_ID}/messages`;
+const WA_HEADERS = () => ({
   Authorization:  `Bearer ${WA_TOKEN}`,
   'Content-Type': 'application/json',
 });
@@ -98,7 +96,7 @@ function saveOTP(phone, otp, carNumber) {
   otpStore.set(phone, {
     otp,
     carNumber,
-    expiresAt: Date.now() + 10 * 60 * 1000, // 10 min
+    expiresAt: Date.now() + 10 * 60 * 1000,
   });
 }
 
@@ -112,12 +110,12 @@ function validateOTP(phone, input) {
   if (record.otp !== String(input).trim())
     return { valid: false, reason: 'Wrong OTP' };
   const carNumber = record.carNumber;
-  otpStore.delete(phone); // one-time use
+  otpStore.delete(phone);
   return { valid: true, carNumber };
 }
 
 function generateOTP() {
-  return String(Math.floor(10 + Math.random() * 90)); // 2-digit
+  return String(Math.floor(10 + Math.random() * 90));
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -166,10 +164,30 @@ app.get('/', (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────
+// LIST TEMPLATES — check Meta approved templates
+// ─────────────────────────────────────────────────────────────
+app.get('/list-templates', async (req, res) => {
+  try {
+    const response = await axios.get(
+      `https://graph.facebook.com/v19.0/${WA_PHONE_ID}/message_templates?limit=100`,
+      { headers: WA_HEADERS() }
+    );
+    const templates = response.data.data.map(t => ({
+      name:     t.name,
+      language: t.language,
+      status:   t.status,
+    }));
+    res.json({ total: templates.length, templates });
+  } catch (err) {
+    res.status(500).json({ error: err.response?.data || err.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────
 // PARKING ROUTES
 // ─────────────────────────────────────────────────────────────
 
-// GET all cars — no orderBy to avoid Firestore index
+// GET all cars
 app.get('/api/parking/all', async (req, res) => {
   try {
     const snap = await col.get();
@@ -280,10 +298,6 @@ app.delete('/api/parking/:id', async (req, res) => {
 
 // ─────────────────────────────────────────────────────────────
 // WHATSAPP — SEND MESSAGES (called by Flutter)
-//
-// Supported types:
-//   { phone, type: 'text', message }
-//   { phone, type: 'template', templateName, bodyParams: [] }
 // ─────────────────────────────────────────────────────────────
 app.post('/send-messages', async (req, res) => {
   const { phone, type, message, templateName, bodyParams } = req.body;
@@ -312,9 +326,6 @@ app.post('/send-messages', async (req, res) => {
 
 // ─────────────────────────────────────────────────────────────
 // CAR READY — Flutter calls this when driver taps Verify
-// 1. Generates OTP
-// 2. Sends OTP to guest as plain text (works within 24hr window)
-// 3. Returns OTP + 2 decoys to Flutter (driver sees 3 circles)
 // ─────────────────────────────────────────────────────────────
 app.post('/car-ready', async (req, res) => {
   const { phone, carNumber } = req.body;
@@ -325,14 +336,12 @@ app.post('/car-ready', async (req, res) => {
   saveOTP(phone, otp, carNumber);
   console.log(`🔑 OTP for ${phone}: ${otp}`);
 
-  // Generate 2 unique decoys
   const decoys = [];
   while (decoys.length < 2) {
     const d = String(Math.floor(10 + Math.random() * 90));
     if (d !== otp && !decoys.includes(d)) decoys.push(d);
   }
 
-  // Shuffle OTP into random position
   const options = [...decoys, otp];
   for (let i = options.length - 1; i > 0; i--) {
     const j = Math.floor(Math.random() * (i + 1));
@@ -340,7 +349,6 @@ app.post('/car-ready', async (req, res) => {
   }
 
   try {
-    // MSG 4: Dynamic plain text OTP — cannot be a template (OTP changes each time)
     const otpMessage =
       `Your car *${carNumber}* is now at the main entrance and ready for pickup.\n\n` +
       `Please show the code *${otp}* to the valet executive to collect your vehicle.\n\n` +
@@ -358,9 +366,6 @@ app.post('/car-ready', async (req, res) => {
 
 // ─────────────────────────────────────────────────────────────
 // VERIFY OTP — Flutter calls after driver selects correct circle
-// 1. Validates OTP
-// 2. Sends handover_complete template to guest
-// 3. Updates Firestore status → delivered
 // ─────────────────────────────────────────────────────────────
 app.post('/verify-otp', async (req, res) => {
   const { phone, otp, docId } = req.body;
@@ -377,14 +382,12 @@ app.post('/verify-otp', async (req, res) => {
   console.log(`✅ OTP verified | ${phone} | Car: ${result.carNumber}`);
 
   try {
-    // MSG 5: handover_complete template → guest gets delivery confirmation
     await sendTemplateMessage(phone, 'handover_complete', [
       VENUE_NAME,
       result.carNumber,
     ]);
     console.log(`✅ MSG 5 (handover_complete) → ${phone} | Car: ${result.carNumber}`);
 
-    // Update Firestore status → delivered if docId provided
     if (docId) {
       const now = admin.firestore.FieldValue.serverTimestamp();
       const ref = col.doc(docId);
@@ -425,7 +428,6 @@ app.get('/webhook', (req, res) => {
 
 // ─────────────────────────────────────────────────────────────
 // WHATSAPP — WEBHOOK RECEIVE
-// Guest taps "Retrieve Car" → update Firestore → Flutter popup
 // ─────────────────────────────────────────────────────────────
 app.post('/webhook', (req, res) => {
   res.status(200).send('OK');
@@ -444,18 +446,15 @@ async function processIncomingMessage(body) {
     const from = message.from;
     console.log(`💬 MSG TYPE: ${message.type} | FROM: ${from}`);
 
-    // ── Template quick-reply button (from parked_confirmation template) ──
     if (message.type === 'button') {
       const text = (message.button?.text || '').toLowerCase().trim();
       console.log(`🔘 Template button: "${text}"`);
-      // Match any retrieve button text variation
       if (text.includes('retrieve') || text === 'retrieve car') {
         await handleRetrieveCar(from);
       }
       return;
     }
 
-    // ── Interactive button (fallback) ──
     if (message.type === 'interactive') {
       const id = message.interactive.button_reply?.id;
       console.log(`🔘 Interactive: "${id}"`);
@@ -463,7 +462,6 @@ async function processIncomingMessage(body) {
       return;
     }
 
-    // ── Text messages ──
     if (message.type === 'text') {
       const lower = message.text.body.trim().toLowerCase();
       if (lower === 'hi' || lower === 'hello') {
@@ -478,14 +476,10 @@ async function processIncomingMessage(body) {
 
 // ─────────────────────────────────────────────────────────────
 // RETRIEVE CAR HANDLER
-// Guest taps "Retrieve Car" on WhatsApp →
-//   1. Send retrieval_progress template
-//   2. Update Firestore → retrieve_requested (Flutter listens instantly)
 // ─────────────────────────────────────────────────────────────
 async function handleRetrieveCar(from) {
   console.log(`🚗 Retrieve Car request from: ${from}`);
 
-  // Build all phone variants to match any storage format
   const digits  = from.replace(/[^0-9]/g, '');
   const phone10 = digits.length > 10 ? digits.slice(-10) : digits;
   const phone12 = `91${phone10}`;
@@ -493,7 +487,6 @@ async function handleRetrieveCar(from) {
   console.log(`🔍 Checking phone variants: ${phoneVariants.join(', ')}`);
 
   try {
-    // Try each variant — match whichever format was stored in Firestore
     let matchedDoc = null;
     for (const ph of phoneVariants) {
       const snap = await col
@@ -519,26 +512,22 @@ async function handleRetrieveCar(from) {
     const carData   = matchedDoc.data();
     const carNumber = carData.vehicle_number || '';
 
-    // MSG 3: retrieval_progress template → guest sees "car is being retrieved"
     await sendTemplateMessage(from, 'retrieval_progress', [carNumber]);
     console.log(`✅ MSG 3 (retrieval_progress) → ${from} | Car: ${carNumber}`);
 
-    // Update Firestore → retrieve_requested (Flutter Firestore listener fires instantly)
     await docRef.update({
       status:                'retrieve_requested',
       Retrieve_request_time: admin.firestore.FieldValue.serverTimestamp(),
     });
     console.log(`✅ Firestore updated: retrieve_requested | Car: ${carNumber}`);
 
-    // Send FCM push notification to driver app
-    // carId and carNumber passed so app can show exact car details
     await sendFCMNotification(
       'Car Retrieve Request 🚗',
       `Vehicle ${carNumber} — guest is waiting`,
       {
         carNumber,
         carId: matchedDoc.id,
-        type: 'retrieve_requested'
+        type:  'retrieve_requested',
       }
     );
 
@@ -590,7 +579,6 @@ async function sendTemplateMessage(to, templateName, bodyParams = []) {
     const waErr = err.response?.data?.error;
     console.error(`❌ sendTemplateMessage [${templateName}] to ${to}:`, waErr?.message || err.message);
     console.error(`   Code: ${waErr?.code} | Type: ${waErr?.type}`);
-    // code 132001 = template not found, 130472 = outside 24hr window
     if (waErr?.code === 132001) {
       console.error(`   ⚠️  Template "${templateName}" does not exist — check Meta template name`);
     }
@@ -606,7 +594,6 @@ async function sendTemplateMessage(to, templateName, bodyParams = []) {
 // ─────────────────────────────────────────────────────────────
 async function sendFCMNotification(title, body, data = {}) {
   try {
-    // Get all FCM tokens from Firestore
     const tokensSnap = await db.collection('fcm_tokens').get();
     if (tokensSnap.empty) {
       console.log('⚠️ No FCM tokens found');
@@ -622,10 +609,10 @@ async function sendFCMNotification(title, body, data = {}) {
       android: {
         priority: 'high',
         notification: {
-          channelId: 'wotiko_retrieve',
-          sound: 'car_lock_sms',
-          priority: 'max',
-          visibility: 'public',
+          channelId:             'wotiko_retrieve',
+          sound:                 'car_lock_sms',
+          priority:              'max',
+          visibility:            'public',
           defaultVibrateTimings: true,
         },
       },
