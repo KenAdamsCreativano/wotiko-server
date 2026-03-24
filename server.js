@@ -66,6 +66,13 @@ console.log('✅ Firebase Admin initialized');
 // ── WhatsApp config ────────────────────────────────────────────
 const WA_TOKEN    = process.env.WHATSAPP_ACCESS_TOKEN;
 const WA_PHONE_ID = process.env.WHATSAPP_PHONE_NUMBER_ID;
+
+// Validate WhatsApp config on startup
+if (!WA_TOKEN || !WA_PHONE_ID) {
+  console.error('❌ CRITICAL: WHATSAPP_ACCESS_TOKEN or WHATSAPP_PHONE_NUMBER_ID missing from .env');
+} else {
+  console.log(`✅ WhatsApp configured | Phone ID: ${WA_PHONE_ID}`);
+}
 const WA_VERIFY   = process.env.WEBHOOK_VERIFY_TOKEN || 'my-verify-token';
 const WA_BASE     = `https://graph.facebook.com/v19.0/${WA_PHONE_ID}/messages`;
 const WA_HEADERS  = () => ({
@@ -524,10 +531,15 @@ async function handleRetrieveCar(from) {
     console.log(`✅ Firestore updated: retrieve_requested | Car: ${carNumber}`);
 
     // Send FCM push notification to driver app
+    // carId and carNumber passed so app can show exact car details
     await sendFCMNotification(
       'Car Retrieve Request 🚗',
-      `Vehicle ${carNumber} guest is waiting`,
-      { carNumber, type: 'retrieve_requested' }
+      `Vehicle ${carNumber} — guest is waiting`,
+      {
+        carNumber,
+        carId: matchedDoc.id,
+        type: 'retrieve_requested'
+      }
     );
 
   } catch (err) {
@@ -539,10 +551,18 @@ async function handleRetrieveCar(from) {
 // WHATSAPP API HELPERS
 // ─────────────────────────────────────────────────────────────
 async function sendTextMessage(to, text) {
-  const res = await axios.post(WA_BASE,
-    { messaging_product: 'whatsapp', to, type: 'text', text: { body: text } },
-    { headers: WA_HEADERS() });
-  return res.data;
+  try {
+    const res = await axios.post(WA_BASE,
+      { messaging_product: 'whatsapp', to, type: 'text', text: { body: text } },
+      { headers: WA_HEADERS() });
+    console.log(`✅ Text sent to ${to}`);
+    return res.data;
+  } catch (err) {
+    const waErr = err.response?.data?.error;
+    console.error(`❌ sendTextMessage to ${to}:`, waErr?.message || err.message);
+    console.error(`   Code: ${waErr?.code} | Type: ${waErr?.type}`);
+    throw err;
+  }
 }
 
 async function sendTemplateMessage(to, templateName, bodyParams = []) {
@@ -552,7 +572,7 @@ async function sendTemplateMessage(to, templateName, bodyParams = []) {
     type: 'template',
     template: {
       name:     templateName,
-      language: { code: 'en' },
+      language: { code: 'en_US' },
       ...(bodyParams.length > 0 && {
         components: [{
           type:       'body',
@@ -562,8 +582,23 @@ async function sendTemplateMessage(to, templateName, bodyParams = []) {
     },
   };
   console.log(`📤 Template: ${templateName} → ${to} | params:`, bodyParams);
-  const res = await axios.post(WA_BASE, payload, { headers: WA_HEADERS() });
-  return res.data;
+  try {
+    const res = await axios.post(WA_BASE, payload, { headers: WA_HEADERS() });
+    console.log(`✅ Template sent: ${templateName} → ${to}`);
+    return res.data;
+  } catch (err) {
+    const waErr = err.response?.data?.error;
+    console.error(`❌ sendTemplateMessage [${templateName}] to ${to}:`, waErr?.message || err.message);
+    console.error(`   Code: ${waErr?.code} | Type: ${waErr?.type}`);
+    // code 132001 = template not found, 130472 = outside 24hr window
+    if (waErr?.code === 132001) {
+      console.error(`   ⚠️  Template "${templateName}" does not exist — check Meta template name`);
+    }
+    if (waErr?.code === 131047 || waErr?.code === 130472) {
+      console.error(`   ⚠️  Outside 24hr window — guest must message first`);
+    }
+    throw err;
+  }
 }
 
 // ─────────────────────────────────────────────────────────────
