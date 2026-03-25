@@ -407,12 +407,18 @@ async function handleRetrieveCar(from) {
 }
 
 // ─────────────────────────────────────────────────────────────
+// TEMPLATE LANGUAGE CACHE
+// Remembers which locale worked for each template so we don't
+// retry every time. Persists for the lifetime of the process.
+// ─────────────────────────────────────────────────────────────
+const templateLocaleCache = new Map();
+
+// All locales to try in order — covers every WhatsApp template
+// language option available in Meta Business Manager
+const LOCALE_CANDIDATES = ['en', 'en_US', 'en_GB'];
+
+// ─────────────────────────────────────────────────────────────
 // WHATSAPP HELPERS
-//
-// FIX: language code 'en' → 'en_US'
-// Meta looks up templates by name + locale together.
-// Sending 'en' causes "Template name does not exist" even when
-// the template IS approved, because Meta stores it under 'en_US'.
 // ─────────────────────────────────────────────────────────────
 async function sendTextMessage(to, text) {
   const res = await axios.post(WA_BASE,
@@ -421,25 +427,57 @@ async function sendTextMessage(to, text) {
   return res.data;
 }
 
+// Tries each locale candidate until one works, then caches it.
+// This means regardless of which language you picked in Meta,
+// it will find it automatically and remember it forever.
 async function sendTemplateMessage(to, templateName, bodyParams = []) {
-  const payload = {
-    messaging_product: 'whatsapp',
-    to,
-    type: 'template',
-    template: {
-      name:     templateName,
-      language: { code: 'en_US' }, // ← FIX: 'en' → 'en_US'
-      ...(bodyParams.length > 0 && {
-        components: [{
-          type:       'body',
-          parameters: bodyParams.map(text => ({ type: 'text', text: String(text) })),
-        }],
-      }),
-    },
-  };
-  console.log(`📤 Template: ${templateName} → ${to} | params:`, bodyParams);
-  const res = await axios.post(WA_BASE, payload, { headers: WA_HEADERS() });
-  return res.data;
+  const components = bodyParams.length > 0
+    ? [{ type: 'body', parameters: bodyParams.map(t => ({ type: 'text', text: String(t) })) }]
+    : [];
+
+  // Use cached locale if we already found it for this template
+  const cached = templateLocaleCache.get(templateName);
+  const locales = cached ? [cached] : LOCALE_CANDIDATES;
+
+  let lastError = null;
+
+  for (const locale of locales) {
+    const payload = {
+      messaging_product: 'whatsapp',
+      to,
+      type: 'template',
+      template: {
+        name:     templateName,
+        language: { code: locale },
+        ...(components.length > 0 && { components }),
+      },
+    };
+
+    try {
+      console.log(`📤 Template: ${templateName} → ${to} | locale: ${locale} | params:`, bodyParams);
+      const res = await axios.post(WA_BASE, payload, { headers: WA_HEADERS() });
+      // Success — cache this locale for next time
+      if (!cached) {
+        templateLocaleCache.set(templateName, locale);
+        console.log(`✅ Cached locale "${locale}" for template "${templateName}"`);
+      }
+      return res.data;
+    } catch (err) {
+      const code = err.response?.data?.error?.code;
+      // 132001 = template not found in this locale — try next locale
+      if (code === 132001) {
+        console.warn(`⚠️  Template "${templateName}" not found in locale "${locale}", trying next...`);
+        lastError = err;
+        continue;
+      }
+      // Any other error (bad token, rate limit etc) — throw immediately
+      throw err;
+    }
+  }
+
+  // All locales exhausted — throw the last error
+  console.error(`❌ Template "${templateName}" not found in any locale: ${LOCALE_CANDIDATES.join(', ')}`);
+  throw lastError;
 }
 
 // ─────────────────────────────────────────────────────────────
