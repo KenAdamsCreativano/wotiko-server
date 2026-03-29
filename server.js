@@ -1,19 +1,25 @@
 /**
  * server.js — Wotiko Valet Backend + WhatsApp Bot
  *
- * FIXES IN THIS VERSION:
- *   1. Template language code: 'en' → 'en_US'
- *      Meta requires exact locale codes. 'en' alone causes
- *      "template does not exist" even if the template name is correct.
+ * MESSAGE FLOW:
+ *   MSG 1 → template: parked  [carNumber, driverName, slotMins]
+ *     Flutter sends after car saved to Firestore
+ *     Has "Retrieve Car" quick-reply button
  *
- *   2. FCM payload: data-only (no `notification` key)
- *      When app is CLOSED on Android, system intercepts messages
- *      that have a `notification` key and shows its own notification,
- *      skipping Flutter's _onBackgroundMessage entirely.
- *      Data-only messages always reach _onBackgroundMessage so Flutter
- *      can show the notification with the correct channel + sound.
+ *   MSG 2 → plain text OTP  (AUTO via webhook when guest taps Retrieve Car)
+ *     Server sends: "On it! ...less than X mins... code: OTP"
+ *     OTP stored under NORMALIZED phone (always 12-digit: 91XXXXXXXXXX)
+ *     Firestore status → retrieve_requested
+ *     Flutter listener → popup shown to driver
  *
- *   3. carId included in FCM data so Flutter opens correct car screen.
+ *   MSG 3 → template: delivered  [carNumber]
+ *     Driver taps Deliver after correct OTP
+ *
+ *   Wrong OTP:
+ *     Driver sees error on OTP screen
+ *     Driver goes back to CarDetailsScreen manually
+ *     Driver taps Verify again → /car-ready called → NEW OTP → new MSG 2
+ *     Only ONE message per /car-ready call — no duplicates
  */
 
 const express = require('express');
@@ -23,9 +29,8 @@ const morgan  = require('morgan');
 const axios   = require('axios');
 require('dotenv').config();
 
-// ── Firebase ───────────────────────────────────────────────────
+// ── Firebase ──────────────────────────────────────────────────
 const admin = require('firebase-admin');
-
 admin.initializeApp({
   credential: admin.credential.cert({
     projectId:   process.env.FIREBASE_PROJECT_ID,
@@ -37,7 +42,7 @@ const db  = admin.firestore();
 const col = db.collection('parked_cars');
 console.log('✅ Firebase Admin initialized');
 
-// ── WhatsApp config ────────────────────────────────────────────
+// ── WhatsApp ──────────────────────────────────────────────────
 const WA_TOKEN    = process.env.WHATSAPP_ACCESS_TOKEN;
 const WA_PHONE_ID = process.env.WHATSAPP_PHONE_NUMBER_ID;
 const WA_VERIFY   = process.env.WEBHOOK_VERIFY_TOKEN || 'my-verify-token';
@@ -49,7 +54,10 @@ const WA_HEADERS  = () => ({
 
 const VENUE_NAME = 'Wotiko Valet';
 
-// ── Express ────────────────────────────────────────────────────
+// Slot → minutes — MUST match Flutter kSlotMinutes
+const SLOT_MINUTES = { 'A': 5, 'B': 3, 'C': 6, 'D': 7, 'E': 8, 'OTHER': 10 };
+
+// ── Express ───────────────────────────────────────────────────
 const app = express();
 app.use(helmet({ contentSecurityPolicy: false }));
 app.use(cors({ origin: '*', methods: ['GET', 'POST', 'PATCH', 'DELETE'] }));
@@ -57,29 +65,112 @@ app.use(morgan('dev'));
 app.use(express.json({ type: '*/*' }));
 
 // ─────────────────────────────────────────────────────────────
-// OTP STORE
+// PHONE NORMALIZER
+// ALL OTP store keys use normalized form: 91XXXXXXXXXX (12 digits)
+// This is the single source of truth — fixes the key mismatch bug
+// ─────────────────────────────────────────────────────────────
+function normalizePhone(phone) {
+  const digits  = String(phone).replace(/[^0-9]/g, '');
+  const phone10 = digits.length > 10 ? digits.slice(-10) : digits;
+  return `91${phone10}`; // always 12 digits
+}
+
+function buildPhoneVariants(phone) {
+  const digits  = String(phone).replace(/[^0-9]/g, '');
+  const phone10 = digits.length > 10 ? digits.slice(-10) : digits;
+  const phone12 = `91${phone10}`;
+  return [...new Set([digits, phone10, phone12])];
+}
+
+// ─────────────────────────────────────────────────────────────
+// OTP STORE  key = normalizePhone(phone) always
 // ─────────────────────────────────────────────────────────────
 const otpStore = new Map();
 
-function saveOTP(phone, otp, carNumber) {
-  otpStore.set(phone, { otp, carNumber, expiresAt: Date.now() + 10 * 60 * 1000 });
+function saveOTP(phone, otp, carNumber, slotMins) {
+  const key = normalizePhone(phone); // always normalized
+  otpStore.set(key, {
+    otp,
+    carNumber,
+    slotMins,
+    expiresAt: Date.now() + 10 * 60 * 1000, // 10 min
+  });
+  console.log(`💾 OTP saved | key: ${key} | otp: ${otp}`);
 }
 
 function validateOTP(phone, input) {
-  const record = otpStore.get(phone);
+  const key    = normalizePhone(phone); // always normalized
+  const record = otpStore.get(key);
+  console.log(`🔍 Validating OTP | key: ${key} | input: ${input} | stored: ${record?.otp}`);
   if (!record) return { valid: false, reason: 'No OTP found' };
   if (Date.now() > record.expiresAt) {
-    otpStore.delete(phone);
+    otpStore.delete(key);
     return { valid: false, reason: 'OTP expired' };
   }
-  if (record.otp !== String(input).trim()) return { valid: false, reason: 'Wrong OTP' };
-  const carNumber = record.carNumber;
-  otpStore.delete(phone);
-  return { valid: true, carNumber };
+  if (record.otp !== String(input).trim())
+    return { valid: false, reason: 'Wrong OTP' };
+  const { carNumber, slotMins } = record;
+  otpStore.delete(key); // one-time use
+  return { valid: true, carNumber, slotMins };
 }
 
 function generateOTP() {
-  return String(Math.floor(10 + Math.random() * 90));
+  return String(Math.floor(10 + Math.random() * 90)); // 2-digit
+}
+
+// ─────────────────────────────────────────────────────────────
+// TEMPLATE LOCALE AUTO-DETECT
+// Tries en → en_US → en_GB, caches the working one
+// ─────────────────────────────────────────────────────────────
+const templateLocaleCache = new Map();
+const LOCALE_CANDIDATES   = ['en', 'en_US', 'en_GB'];
+
+async function sendTemplateMessage(to, templateName, bodyParams = []) {
+  const components = bodyParams.length > 0
+    ? [{ type: 'body', parameters: bodyParams.map(t => ({ type: 'text', text: String(t) })) }]
+    : [];
+
+  const cached  = templateLocaleCache.get(templateName);
+  const locales = cached ? [cached] : LOCALE_CANDIDATES;
+  let lastError = null;
+
+  for (const locale of locales) {
+    try {
+      const payload = {
+        messaging_product: 'whatsapp',
+        to,
+        type: 'template',
+        template: {
+          name:     templateName,
+          language: { code: locale },
+          ...(components.length > 0 && { components }),
+        },
+      };
+      console.log(`📤 Template: ${templateName} → ${to} | locale: ${locale} | params:`, bodyParams);
+      const res = await axios.post(WA_BASE, payload, { headers: WA_HEADERS() });
+      if (!cached) {
+        templateLocaleCache.set(templateName, locale);
+        console.log(`✅ Cached locale "${locale}" for "${templateName}"`);
+      }
+      return res.data;
+    } catch (err) {
+      if (err.response?.data?.error?.code === 132001) {
+        console.warn(`⚠️ "${templateName}" not in locale "${locale}", trying next...`);
+        lastError = err;
+        continue;
+      }
+      throw err; // non-locale error — throw immediately
+    }
+  }
+  console.error(`❌ Template "${templateName}" not found in any locale`);
+  throw lastError;
+}
+
+async function sendTextMessage(to, text) {
+  const res = await axios.post(WA_BASE,
+    { messaging_product: 'whatsapp', to, type: 'text', text: { body: text } },
+    { headers: WA_HEADERS() });
+  return res.data;
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -123,9 +214,8 @@ function fmtTime(ts) {
 // ─────────────────────────────────────────────────────────────
 // HEALTH
 // ─────────────────────────────────────────────────────────────
-app.get('/', (req, res) => {
-  res.json({ status: 'OK', service: `${VENUE_NAME} Backend + WhatsApp Bot` });
-});
+app.get('/', (req, res) =>
+  res.json({ status: 'OK', service: `${VENUE_NAME} Backend` }));
 
 // ─────────────────────────────────────────────────────────────
 // PARKING ROUTES
@@ -175,12 +265,8 @@ app.post('/api/parking/park', async (req, res) => {
       exited_time:           null,
       Retrieve_time:         null,
     });
-    console.log(`✅ Parked: ${vehicle_number} | Wing: ${parking_area} | Phone: ${guest_phone}`);
-    res.status(201).json({
-      success: true,
-      docId:   ref.id,
-      message: `Car ${vehicle_number.toUpperCase()} parked in Wing ${parking_area} ✅`,
-    });
+    console.log(`✅ Parked: ${vehicle_number} | Wing: ${parking_area}`);
+    res.status(201).json({ success: true, docId: ref.id });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
@@ -227,40 +313,70 @@ app.delete('/api/parking/:id', async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────
-// SEND MESSAGES
+// SEND MESSAGES — called by Flutter for template messages only
 // ─────────────────────────────────────────────────────────────
 app.post('/send-messages', async (req, res) => {
   const { phone, type, message, templateName, bodyParams } = req.body;
-  if (!phone) return res.status(400).json({ error: 'phone is required' });
+  if (!phone) return res.status(400).json({ error: 'phone required' });
   try {
     if (type === 'text') {
-      if (!message) return res.status(400).json({ error: 'message is required' });
       await sendTextMessage(phone, message);
-      return res.json({ success: true, type: 'text' });
+      return res.json({ success: true });
     }
     if (type === 'template') {
-      if (!templateName) return res.status(400).json({ error: 'templateName is required' });
       await sendTemplateMessage(phone, templateName, bodyParams || []);
-      console.log(`✅ Template "${templateName}" → ${phone}`);
-      return res.json({ success: true, type: 'template' });
+      return res.json({ success: true });
     }
-    return res.status(400).json({ error: `Unknown type: ${type}` });
+    res.status(400).json({ error: 'Unknown type' });
   } catch (err) {
-    console.error('❌ /send-messages error:', err.response?.data || err.message);
+    console.error('❌ /send-messages:', err.response?.data || err.message);
     res.status(500).json({ error: err.response?.data?.error?.message || err.message });
   }
 });
 
 // ─────────────────────────────────────────────────────────────
-// CAR READY
+// CAR READY — Flutter calls when driver taps Verify
+//
+// IMPORTANT: This sends MSG 2 to the guest.
+// It is called:
+//   (a) First time: driver taps Verify on CarDetailsScreen
+//   (b) After wrong OTP: driver goes back to CarDetailsScreen
+//       and taps Verify again — this generates a NEW OTP
+//
+// The wrong OTP retry is handled by the driver going BACK
+// to CarDetailsScreen and tapping Verify again — NOT by
+// Flutter calling this endpoint automatically on wrong tap.
+// This prevents duplicate messages from rapid taps.
 // ─────────────────────────────────────────────────────────────
 app.post('/car-ready', async (req, res) => {
   const { phone, carNumber } = req.body;
   if (!phone || !carNumber)
-    return res.status(400).json({ error: 'phone and carNumber are required' });
+    return res.status(400).json({ error: 'phone and carNumber required' });
+
+  // Normalize phone for consistent OTP store key
+  const normalizedPhone = normalizePhone(phone);
+
+  // Get slot from Firestore for correct time
+  let slotMins = 5; // default
+  try {
+    const phoneVariants = buildPhoneVariants(phone);
+    for (const ph of phoneVariants) {
+      const snap = await col
+        .where('guest_phone', '==', ph)
+        .where('vehicle_number', '==', carNumber.toUpperCase())
+        .limit(1).get();
+      if (!snap.empty) {
+        const area = (snap.docs[0].data().parking_area || 'A').toUpperCase();
+        slotMins   = SLOT_MINUTES[area] ?? 5;
+        break;
+      }
+    }
+  } catch (_) {}
+
   const otp = generateOTP();
-  saveOTP(phone, otp, carNumber);
-  console.log(`🔑 OTP for ${phone}: ${otp}`);
+  saveOTP(normalizedPhone, otp, carNumber, slotMins); // uses normalized key
+
+  // Generate 2 decoys
   const decoys = [];
   while (decoys.length < 2) {
     const d = String(Math.floor(10 + Math.random() * 90));
@@ -271,35 +387,47 @@ app.post('/car-ready', async (req, res) => {
     const j = Math.floor(Math.random() * (i + 1));
     [options[i], options[j]] = [options[j], options[i]];
   }
+
   try {
-    const otpMessage =
-      `Your car *${carNumber}* is now at the main entrance and ready for pickup.\n\n` +
-      `Please show the code *${otp}* to the valet executive to collect your vehicle.\n\n` +
-      `We hope you enjoyed your experience at ${VENUE_NAME}!`;
-    await sendTextMessage(phone, otpMessage);
-    console.log(`✅ MSG 4 (OTP text) → ${phone} | OTP: ${otp} | Car: ${carNumber}`);
+    // MSG 2: plain text OTP — sent ONCE per Verify tap
+    const msg =
+      `On it!\n` +
+      `Your car should be at the main entrance in less than ${slotMins} mins.\n\n` +
+      `Share this code with the driver who brings your car:\n*${otp}*\n\n` +
+      `If your car is waiting for more than 10 minutes at the portico, ` +
+      `we will repark the car closeby to keep the portico clear.`;
+
+    await sendTextMessage(normalizedPhone, msg);
+    console.log(`✅ MSG 2 → ${normalizedPhone} | OTP: ${otp} | ${slotMins} mins`);
+
     return res.json({ success: true, otp, options });
   } catch (err) {
-    console.error('❌ /car-ready error:', err.response?.data || err.message);
+    console.error('❌ /car-ready:', err.response?.data || err.message);
     res.status(500).json({ error: err.response?.data?.error?.message || err.message });
   }
 });
 
 // ─────────────────────────────────────────────────────────────
-// VERIFY OTP
+// VERIFY OTP — Flutter calls after driver taps Deliver
 // ─────────────────────────────────────────────────────────────
 app.post('/verify-otp', async (req, res) => {
   const { phone, otp, docId } = req.body;
-  if (!phone || !otp) return res.status(400).json({ error: 'phone and otp are required' });
-  const result = validateOTP(phone, otp);
+  if (!phone || !otp)
+    return res.status(400).json({ error: 'phone and otp required' });
+
+  const result = validateOTP(phone, otp); // normalizes internally
   if (!result.valid) {
-    console.log(`❌ OTP wrong for ${phone}: ${result.reason}`);
+    console.log(`❌ OTP invalid for ${normalizePhone(phone)}: ${result.reason}`);
     return res.json({ success: false, reason: result.reason });
   }
-  console.log(`✅ OTP verified | ${phone} | Car: ${result.carNumber}`);
+
+  console.log(`✅ OTP verified | ${normalizePhone(phone)} | Car: ${result.carNumber}`);
+
   try {
-    await sendTemplateMessage(phone, 'handover_complete', [VENUE_NAME, result.carNumber]);
-    console.log(`✅ MSG 5 (handover_complete) → ${phone}`);
+    // MSG 3: delivered template — {{1}} = carNumber
+    await sendTemplateMessage(normalizePhone(phone), 'delivered', [result.carNumber]);
+    console.log(`✅ MSG 3 (delivered) → ${normalizePhone(phone)}`);
+
     if (docId) {
       const now = admin.firestore.FieldValue.serverTimestamp();
       const ref = col.doc(docId);
@@ -314,9 +442,10 @@ app.post('/verify-otp', async (req, res) => {
       await ref.update(update);
       console.log(`✅ Firestore delivered | docId: ${docId}`);
     }
+
     return res.json({ success: true, carNumber: result.carNumber });
   } catch (err) {
-    console.error('❌ /verify-otp error:', err.response?.data || err.message);
+    console.error('❌ /verify-otp:', err.response?.data || err.message);
     res.status(500).json({ error: err.response?.data?.error?.message || err.message });
   }
 });
@@ -346,21 +475,23 @@ async function processIncomingMessage(body) {
       return;
     }
     const from = message.from;
-    console.log(`💬 MSG TYPE: ${message.type} | FROM: ${from}`);
+    console.log(`💬 TYPE: ${message.type} | FROM: ${from}`);
+
     if (message.type === 'button') {
       const text = (message.button?.text || '').toLowerCase().trim();
-      if (text.includes('retrieve') || text === 'retrieve car') await handleRetrieveCar(from);
+      if (text.includes('retrieve')) await handleRetrieveCar(from);
       return;
     }
     if (message.type === 'interactive') {
-      const id = message.interactive.button_reply?.id;
+      const id = message.interactive?.button_reply?.id;
       if (id === 'retrieve_car') await handleRetrieveCar(from);
       return;
     }
     if (message.type === 'text') {
       const lower = message.text.body.trim().toLowerCase();
       if (lower === 'hi' || lower === 'hello') {
-        await sendTextMessage(from, `👋 Welcome to *${VENUE_NAME}*!\n\nOur valet team is ready to assist you.`);
+        await sendTextMessage(from,
+          `👋 Welcome to *${VENUE_NAME}*! Our valet team is ready to assist you.`);
       }
     }
   } catch (err) {
@@ -370,132 +501,73 @@ async function processIncomingMessage(body) {
 
 // ─────────────────────────────────────────────────────────────
 // RETRIEVE CAR HANDLER
+// Guest taps "Retrieve Car" button in WhatsApp →
+//   1. Find car in Firestore
+//   2. Generate OTP, store under normalized phone key
+//   3. Send MSG 2 plain text to guest — EXACTLY ONCE
+//   4. Update Firestore → retrieve_requested
+//   5. FCM push to driver
 // ─────────────────────────────────────────────────────────────
 async function handleRetrieveCar(from) {
-  console.log(`🚗 Retrieve Car from: ${from}`);
-  const digits        = from.replace(/[^0-9]/g, '');
-  const phone10       = digits.length > 10 ? digits.slice(-10) : digits;
-  const phone12       = `91${phone10}`;
-  const phoneVariants = [...new Set([digits, phone10, phone12])];
+  console.log(`🚗 Retrieve from: ${from}`);
+  const normalizedFrom = normalizePhone(from);
+  const phoneVariants  = buildPhoneVariants(from);
+
   try {
     let matchedDoc = null;
     for (const ph of phoneVariants) {
-      const snap = await col.where('guest_phone', '==', ph).where('status', '==', 'parked').limit(1).get();
+      const snap = await col
+        .where('guest_phone', '==', ph)
+        .where('status', '==', 'parked')
+        .limit(1).get();
       if (!snap.empty) { matchedDoc = snap.docs[0]; break; }
     }
+
     if (!matchedDoc) {
-      await sendTextMessage(from, 'We could not find an active parking record. Please contact our valet team.');
+      console.log(`⚠️ No parked car for: ${phoneVariants.join(', ')}`);
+      await sendTextMessage(from,
+        'We could not find an active parking record. Please contact our valet team.');
       return;
     }
+
     const carData   = matchedDoc.data();
     const carNumber = carData.vehicle_number || '';
     const carId     = matchedDoc.id;
+    const area      = (carData.parking_area || 'A').toUpperCase();
+    const slotMins  = SLOT_MINUTES[area] ?? 5;
 
-    await sendTemplateMessage(from, 'retrieval_progress', [carNumber]);
-    console.log(`✅ MSG 3 (retrieval_progress) → ${from} | Car: ${carNumber}`);
+    // Generate OTP — stored under normalized phone key
+    const otp = generateOTP();
+    saveOTP(normalizedFrom, otp, carNumber, slotMins);
 
+    // MSG 2 — send ONCE
+    const msg =
+      `On it!\n` +
+      `Your car should be at the main entrance in less than ${slotMins} mins.\n\n` +
+      `Share this code with the driver who brings your car:\n*${otp}*\n\n` +
+      `If your car is waiting for more than 10 minutes at the portico, ` +
+      `we will repark the car closeby to keep the portico clear.`;
+
+    await sendTextMessage(normalizedFrom, msg);
+    console.log(`✅ MSG 2 → ${normalizedFrom} | OTP: ${otp} | ${slotMins} mins`);
+
+    // Update Firestore
     await matchedDoc.ref.update({
       status:                'retrieve_requested',
       Retrieve_request_time: admin.firestore.FieldValue.serverTimestamp(),
     });
     console.log(`✅ Firestore: retrieve_requested | Car: ${carNumber} | ID: ${carId}`);
 
+    // FCM push
     await sendFCMNotification(carNumber, carId);
+
   } catch (err) {
-    console.error('❌ handleRetrieveCar error:', err.message);
+    console.error('❌ handleRetrieveCar:', err.message);
   }
 }
 
 // ─────────────────────────────────────────────────────────────
-// TEMPLATE LANGUAGE CACHE
-// Remembers which locale worked for each template so we don't
-// retry every time. Persists for the lifetime of the process.
-// ─────────────────────────────────────────────────────────────
-const templateLocaleCache = new Map();
-
-// All locales to try in order — covers every WhatsApp template
-// language option available in Meta Business Manager
-const LOCALE_CANDIDATES = ['en', 'en_US', 'en_GB'];
-
-// ─────────────────────────────────────────────────────────────
-// WHATSAPP HELPERS
-// ─────────────────────────────────────────────────────────────
-async function sendTextMessage(to, text) {
-  const res = await axios.post(WA_BASE,
-    { messaging_product: 'whatsapp', to, type: 'text', text: { body: text } },
-    { headers: WA_HEADERS() });
-  return res.data;
-}
-
-// Tries each locale candidate until one works, then caches it.
-// This means regardless of which language you picked in Meta,
-// it will find it automatically and remember it forever.
-async function sendTemplateMessage(to, templateName, bodyParams = []) {
-  const components = bodyParams.length > 0
-    ? [{ type: 'body', parameters: bodyParams.map(t => ({ type: 'text', text: String(t) })) }]
-    : [];
-
-  // Use cached locale if we already found it for this template
-  const cached = templateLocaleCache.get(templateName);
-  const locales = cached ? [cached] : LOCALE_CANDIDATES;
-
-  let lastError = null;
-
-  for (const locale of locales) {
-    const payload = {
-      messaging_product: 'whatsapp',
-      to,
-      type: 'template',
-      template: {
-        name:     templateName,
-        language: { code: locale },
-        ...(components.length > 0 && { components }),
-      },
-    };
-
-    try {
-      console.log(`📤 Template: ${templateName} → ${to} | locale: ${locale} | params:`, bodyParams);
-      const res = await axios.post(WA_BASE, payload, { headers: WA_HEADERS() });
-      // Success — cache this locale for next time
-      if (!cached) {
-        templateLocaleCache.set(templateName, locale);
-        console.log(`✅ Cached locale "${locale}" for template "${templateName}"`);
-      }
-      return res.data;
-    } catch (err) {
-      const code = err.response?.data?.error?.code;
-      // 132001 = template not found in this locale — try next locale
-      if (code === 132001) {
-        console.warn(`⚠️  Template "${templateName}" not found in locale "${locale}", trying next...`);
-        lastError = err;
-        continue;
-      }
-      // Any other error (bad token, rate limit etc) — throw immediately
-      throw err;
-    }
-  }
-
-  // All locales exhausted — throw the last error
-  console.error(`❌ Template "${templateName}" not found in any locale: ${LOCALE_CANDIDATES.join(', ')}`);
-  throw lastError;
-}
-
-// ─────────────────────────────────────────────────────────────
-// FCM — DATA-ONLY push notification
-//
-// FIX: Removed `notification` key entirely — data-only payload.
-//
-// REASON: When app is CLOSED on Android, FCM delivers any message
-// that has a `notification` key directly to the system tray.
-// Flutter's _onBackgroundMessage handler is NEVER called.
-// Your custom channel (wotiko_retrieve_v3) and ringtone are skipped.
-//
-// With DATA-ONLY messages, FCM always calls _onBackgroundMessage
-// in main.dart regardless of app state. Flutter then calls
-// showRetrieveNotification() which uses wotiko_retrieve_v3 channel
-// with your custom retrieval ringtone — exactly as intended.
-//
-// All data values must be strings (FCM requirement).
+// FCM — data-only push
 // ─────────────────────────────────────────────────────────────
 async function sendFCMNotification(carNumber, carId) {
   try {
@@ -504,10 +576,7 @@ async function sendFCMNotification(carNumber, carId) {
     const tokens = tokensSnap.docs.map(d => d.data().token).filter(Boolean);
     if (!tokens.length) return;
 
-    console.log(`📲 FCM → ${tokens.length} device(s) | Car: ${carNumber} | ID: ${carId}`);
-
-    const message = {
-      // NO `notification` key — data-only so Flutter handles it
+    const response = await admin.messaging().sendEachForMulticast({
       data: {
         type:      'retrieve_requested',
         carNumber: String(carNumber),
@@ -515,29 +584,17 @@ async function sendFCMNotification(carNumber, carId) {
         title:     'Car Retrieve Request',
         body:      `Vehicle ${carNumber} — guest is waiting`,
       },
-      android: {
-        priority: 'high', // wakes device even when app is closed
-        ttl:      60000,  // drop after 60s if undelivered
-      },
+      android: { priority: 'high', ttl: 60000 },
       apns: {
-        headers: {
-          'apns-priority':  '10',
-          'apns-push-type': 'background',
-        },
-        payload: {
-          aps: { 'content-available': 1 }, // wakes iOS in background
-        },
+        headers: { 'apns-priority': '10', 'apns-push-type': 'background' },
+        payload: { aps: { 'content-available': 1 } },
       },
       tokens,
-    };
-
-    const response = await admin.messaging().sendEachForMulticast(message);
-    console.log(`✅ FCM — success: ${response.successCount} / ${tokens.length}`);
-    if (response.failureCount > 0) {
-      response.responses.forEach((r, i) => {
-        if (!r.success) console.warn(`  ❌ Token[${i}]: ${r.error?.code} — ${r.error?.message}`);
-      });
-    }
+    });
+    console.log(`✅ FCM — success: ${response.successCount}/${tokens.length}`);
+    response.responses.forEach((r, i) => {
+      if (!r.success) console.warn(`  ❌ Token[${i}]: ${r.error?.code}`);
+    });
   } catch (err) {
     console.error('❌ FCM error:', err.message);
   }
@@ -548,10 +605,10 @@ async function sendFCMNotification(carNumber, carId) {
 // ─────────────────────────────────────────────────────────────
 const PORT = 8000;
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`\n🏨 ${VENUE_NAME} Backend + WhatsApp Bot`);
-  console.log(`🚀 Running on http://139.59.75.67:${PORT}`);
-  console.log(`📲 POST /send-messages → send WhatsApp msg`);
-  console.log(`🚗 POST /car-ready     → generate OTP + send to guest`);
-  console.log(`✅ POST /verify-otp    → validate OTP + mark delivered`);
-  console.log(`🔗 POST /webhook       → receive WhatsApp events\n`);
+  console.log(`\n🏨 ${VENUE_NAME} Backend`);
+  console.log(`🚀 http://139.59.75.67:${PORT}`);
+  console.log(`📲 POST /send-messages → template messages`);
+  console.log(`🚗 POST /car-ready     → OTP + MSG 2`);
+  console.log(`✅ POST /verify-otp    → validate + MSG 3`);
+  console.log(`🔗 POST /webhook       → WhatsApp events\n`);
 });
