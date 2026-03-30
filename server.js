@@ -44,9 +44,9 @@ const PHRASE_OPTIONS = [
   'Many guests love the',
   'One of our top picks is the',
   'You might enjoy the',
-  'Don't miss out on the',
+  'Do not miss out on the',
   'A must-try from our kitchen is the',
-  'One dish you shouldn't miss is the',
+  'One dish you should not miss is the',
   'Something worth trying next time is the',
 ];
 
