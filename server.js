@@ -84,40 +84,47 @@ function buildPhoneVariants(phone) {
 }
 
 // ─────────────────────────────────────────────────────────────
-// OTP STORE
+// OTP STORE — Firestore-backed (survives server restarts)
+// Collection: otp_store  |  Doc ID: normalizedPhone
 // ─────────────────────────────────────────────────────────────
-const otpStore = new Map();
+const otpCol = () => db.collection('otp_store');
 
-function saveOTP(phone, otp, carNumber, slotMins, options) {
+async function saveOTP(phone, otp, carNumber, slotMins, options) {
   const key = normalizePhone(phone);
-  otpStore.set(key, {
+  await otpCol().doc(key).set({
     otp, carNumber, slotMins, options,
     expiresAt: Date.now() + 15 * 60 * 1000,
+    savedAt:   admin.firestore.FieldValue.serverTimestamp(),
   });
-  console.log(`💾 OTP saved | ${key} | ${otp}`);
+  console.log(`💾 OTP saved (Firestore) | ${key} | ${otp}`);
 }
 
-function getStoredOTP(phone) {
-  const key    = normalizePhone(phone);
-  const record = otpStore.get(key);
-  if (!record) return null;
-  if (Date.now() > record.expiresAt) { otpStore.delete(key); return null; }
+async function getStoredOTP(phone) {
+  const key  = normalizePhone(phone);
+  const snap = await otpCol().doc(key).get();
+  if (!snap.exists) return null;
+  const record = snap.data();
+  if (Date.now() > record.expiresAt) {
+    await otpCol().doc(key).delete();
+    return null;
+  }
   return record;
 }
 
-function validateAndConsumeOTP(phone, input) {
-  const key    = normalizePhone(phone);
-  const record = otpStore.get(key);
-  console.log(`🔍 OTP validate | ${key} | input:${input} stored:${record?.otp}`);
-  if (!record) return { valid: false, reason: 'No OTP found' };
+async function validateAndConsumeOTP(phone, input) {
+  const key  = normalizePhone(phone);
+  const snap = await otpCol().doc(key).get();
+  console.log(`🔍 OTP validate | ${key} | input:${input} stored:${snap.data()?.otp}`);
+  if (!snap.exists) return { valid: false, reason: 'No OTP found' };
+  const record = snap.data();
   if (Date.now() > record.expiresAt) {
-    otpStore.delete(key);
+    await otpCol().doc(key).delete();
     return { valid: false, reason: 'OTP expired' };
   }
   if (record.otp !== String(input).trim())
     return { valid: false, reason: 'Wrong OTP' };
   const { carNumber } = record;
-  otpStore.delete(key);
+  await otpCol().doc(key).delete();
   return { valid: true, carNumber };
 }
 
@@ -336,7 +343,7 @@ app.post('/get-otp', async (req, res) => {
   if (!phone || !carNumber)
     return res.status(400).json({ error: 'phone and carNumber required' });
 
-  const record = getStoredOTP(phone);
+  const record = await getStoredOTP(phone);
   if (!record) {
     console.log(`⚠️ No OTP for ${normalizePhone(phone)} — expired or not set`);
     return res.status(404).json({
@@ -364,7 +371,7 @@ app.post('/wrong-otp', async (req, res) => {
   const newOptions      = makeOptions(newOtp);
 
   // Save new OTP — overwrites old one
-  saveOTP(normalizedPhone, newOtp, carNumber, 5, newOptions);
+  await saveOTP(normalizedPhone, newOtp, carNumber, 5, newOptions);
 
   try {
     // Hardcoded en_US — bypass locale detection for wrong_otp
@@ -401,7 +408,7 @@ app.post('/verify-otp', async (req, res) => {
   if (!phone || !otp)
     return res.status(400).json({ error: 'phone and otp required' });
 
-  const result = validateAndConsumeOTP(phone, otp);
+  const result = await validateAndConsumeOTP(phone, otp);
   if (!result.valid) {
     console.log(`❌ OTP invalid: ${result.reason}`);
     return res.json({ success: false, reason: result.reason });
@@ -534,7 +541,7 @@ async function handleRetrieveCar(from) {
 
     const otp     = generateOTP();
     const options = makeOptions(otp);
-    saveOTP(normalizedFrom, otp, carNumber, slotMins, options);
+    await saveOTP(normalizedFrom, otp, carNumber, slotMins, options);
 
     const msg =
       `On it!\n` +
