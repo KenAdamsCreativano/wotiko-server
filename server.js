@@ -34,28 +34,28 @@ const VENUE_NAME   = 'Wotiko Valet';
 const SLOT_MINUTES = { 'A': 2, 'B': 2, 'C': 3, 'D': 4, 'E': 5, 'OTHER': 6 };
 
 // ── Farewell message variable pools ──────────────────────────
-const V1_OPTIONS = [
-  "Next time you're here,",
-  'On your next visit,',
-  "Next time, don't miss this -",
-  'Next time',
-  'For your next experience,',
+// ── Farewell message variable pools ──────────────────────────
+// Template: end
+// {{1}}=carNumber, {{2}}=phrase, {{3}}=*dish* (bold in WhatsApp)
+const PHRASE_OPTIONS = [
+  'On your next visit, you should try the',
+  'Our team highly recommends the',
+  'A favourite among our team is the',
+  'Many guests love the',
+  'One of our top picks is the',
+  'You might enjoy the',
+  'Don't miss out on the',
+  'A must-try from our kitchen is the',
+  'One dish you shouldn't miss is the',
+  'Something worth trying next time is the',
 ];
 
-const V2_OPTIONS = [
-  'Our team absolutely loves the',
-  'A team favourite is the',
-  'Our team is obsessed with the',
-  'Our team recommends the',
-  "Our team's top pick is the",
-];
-
-const V3_OPTIONS = [
-  'Truffle Garlic Fried Rice',
-  'Curry Butter Garlic Prawns',
-  'Dragon Chicken',
-  'Chicken Quesadillas',
-  'Pan Grilled Salmon',
+const DISH_OPTIONS = [
+  '*Truffle Garlic Fried Rice*',
+  '*Curry Butter Garlic Prawns*',
+  '*Dragon Chicken*',
+  '*Chicken Quesadillas*',
+  '*Pan Grilled Salmon*',
 ];
 
 function randomPick(arr) {
@@ -155,7 +155,7 @@ function makeOptions(otp) {
 const templateLocaleCache = new Map();
 // Pre-seed known template locales — skips trial-and-error on every call
 templateLocaleCache.set('confirm_parked', 'en');
-templateLocaleCache.set('delivered', 'en');
+templateLocaleCache.set('end', 'en');
 const LOCALE_CANDIDATES   = ['en', 'en_US', 'en_GB'];
 
 async function sendTemplateMessage(to, templateName, bodyParams = []) {
@@ -413,22 +413,20 @@ app.post('/verify-otp', async (req, res) => {
   console.log(`✅ OTP verified | Car: ${result.carNumber}`);
 
   // Pick variables randomly from pools
-  const phrase   = randomPick(V1_OPTIONS);
-  const teamLine = randomPick(V2_OPTIONS);
-  const dish     = randomPick(V3_OPTIONS);
+  const phrase = randomPick(PHRASE_OPTIONS);
+  const dish   = randomPick(DISH_OPTIONS);
 
-  console.log(`🎲 Farewell vars → v1:"${phrase}" v2:"${teamLine}" v3:"${dish}"`);
+  console.log(`🎲 Farewell vars → phrase:"${phrase}" dish:"${dish}"`);
 
   try {
-    // MSG 3: delivered template
-    // {{1}}=carNumber, {{2}}=phrase, {{3}}=teamLine, {{4}}=dish
-    await sendTemplateMessage(normalizePhone(phone), 'delivered', [
+    // MSG 3: end template
+    // {{1}}=carNumber, {{2}}=phrase, {{3}}=dish (bold via * in WhatsApp)
+    await sendTemplateMessage(normalizePhone(phone), 'end', [
       result.carNumber,
       phrase,
-      teamLine,
       dish,
     ]);
-    console.log(`✅ MSG 3 (delivered) → ${normalizePhone(phone)} | Car: ${result.carNumber}`);
+    console.log(`✅ MSG 3 (end) → ${normalizePhone(phone)} | Car: ${result.carNumber}`);
 
     // Update Firestore → delivered
     if (docId) {
@@ -606,6 +604,6 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`📲 /send-messages → MSG 1 parked template`);
   console.log(`🔑 /get-otp       → get circles, no WA msg`);
   console.log(`⚠️  /wrong-otp    → new OTP + plain text to guest`);
-  console.log(`✅ /verify-otp    → MSG 3 delivered (random vars) + Firestore`);
+  console.log(`✅ /verify-otp    → MSG 3 end template (random vars) + Firestore`);
   console.log(`🔗 /webhook       → MSG 2 auto on Retrieve Car\n`);
 });
