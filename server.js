@@ -31,7 +31,7 @@ const WA_HEADERS  = () => ({
 });
 
 const VENUE_NAME   = 'Wotiko Valet';
-const SLOT_MINUTES = { 'A': 5, 'B': 3, 'C': 6, 'D': 7, 'E': 8, 'OTHER': 10 };
+const SLOT_MINUTES = { 'A': 2, 'B': 2, 'C': 3, 'D': 4, 'E': 5, 'OTHER': 6 };
 
 // ── Farewell message variable pools ──────────────────────────
 const V1_OPTIONS = [
