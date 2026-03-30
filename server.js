@@ -143,7 +143,11 @@ function makeOptions(otp) {
 // TEMPLATE LOCALE AUTO-DETECT
 // ─────────────────────────────────────────────────────────────
 const templateLocaleCache = new Map();
-const LOCALE_CANDIDATES   = ['en', 'en_US', 'en_GB'];
+// Pre-seed known template locales — skips trial-and-error on every call
+templateLocaleCache.set('wrong_otp', 'en_US');
+templateLocaleCache.set('parked',    'en_US');
+templateLocaleCache.set('delivered', 'en_US');
+const LOCALE_CANDIDATES   = ['en_US', 'en', 'en_GB'];
 
 async function sendTemplateMessage(to, templateName, bodyParams = []) {
   const components = bodyParams.length > 0
