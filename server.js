@@ -154,8 +154,7 @@ function makeOptions(otp) {
 // ─────────────────────────────────────────────────────────────
 const templateLocaleCache = new Map();
 // Pre-seed known template locales — skips trial-and-error on every call
-templateLocaleCache.set('wrong_otp', 'en');
-templateLocaleCache.set('parked',    'en');
+templateLocaleCache.set('confirm_parked', 'en');
 templateLocaleCache.set('delivered', 'en');
 const LOCALE_CANDIDATES   = ['en', 'en_US', 'en_GB'];
 
@@ -361,7 +360,7 @@ app.post('/get-otp', async (req, res) => {
 // ─────────────────────────────────────────────────────────────
 // WRONG OTP — driver tapped wrong circle
 // 1. Generate fresh OTP + options
-// 2. Send wrong_otp template to guest with new code
+// 2. Send plain text message to guest with new code
 // 3. Save new OTP — replaces old one
 // ─────────────────────────────────────────────────────────────
 app.post('/wrong-otp', async (req, res) => {
@@ -377,22 +376,16 @@ app.post('/wrong-otp', async (req, res) => {
   await saveOTP(normalizedPhone, newOtp, carNumber, 5, newOptions);
 
   try {
-    // Hardcoded en — all templates use en locale
-    const wrongOtpPayload = {
-      messaging_product: 'whatsapp',
-      to:   normalizedPhone,
-      type: 'template',
-      template: {
-        name:     'wrong_otp',
-        language: { code: 'en' },
-        components: [{
-          type:       'body',
-          parameters: [{ type: 'text', text: String(newOtp) }],
-        }],
-      },
-    };
-    await axios.post(WA_BASE, wrongOtpPayload, { headers: WA_HEADERS() });
-    console.log(`✅ Wrong OTP → new: ${newOtp} | ${normalizedPhone}`);
+    // Send as plain text — same style as MSG 2
+    const msg =
+      `Looks like the code was entered incorrectly.
+
+` +
+      `Please share this updated code with the driver:
+*${newOtp}*`;
+
+    await sendTextMessage(normalizedPhone, msg);
+    console.log(`✅ Wrong OTP (text) → new: ${newOtp} | ${normalizedPhone}`);
     return res.json({ success: true, otp: newOtp, options: newOptions });
   } catch (err) {
     console.error('❌ /wrong-otp:', err.response?.data || err.message);
@@ -612,7 +605,7 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 http://139.59.75.67:${PORT}`);
   console.log(`📲 /send-messages → MSG 1 parked template`);
   console.log(`🔑 /get-otp       → get circles, no WA msg`);
-  console.log(`⚠️  /wrong-otp    → new OTP + wrong_otp template`);
+  console.log(`⚠️  /wrong-otp    → new OTP + plain text to guest`);
   console.log(`✅ /verify-otp    → MSG 3 delivered (random vars) + Firestore`);
   console.log(`🔗 /webhook       → MSG 2 auto on Retrieve Car\n`);
 });
