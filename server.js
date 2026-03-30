@@ -367,9 +367,21 @@ app.post('/wrong-otp', async (req, res) => {
   saveOTP(normalizedPhone, newOtp, carNumber, 5, newOptions);
 
   try {
-    // Template: "Looks like the code was entered incorrectly.
-    //            Please share this updated code with the driver: {{1}}"
-    await sendTemplateMessage(normalizedPhone, 'wrong_otp', [newOtp]);
+    // Hardcoded en_US — bypass locale detection for wrong_otp
+    const wrongOtpPayload = {
+      messaging_product: 'whatsapp',
+      to:   normalizedPhone,
+      type: 'template',
+      template: {
+        name:     'wrong_otp',
+        language: { code: 'en_US' },
+        components: [{
+          type:       'body',
+          parameters: [{ type: 'text', text: String(newOtp) }],
+        }],
+      },
+    };
+    await axios.post(WA_BASE, wrongOtpPayload, { headers: WA_HEADERS() });
     console.log(`✅ Wrong OTP → new: ${newOtp} | ${normalizedPhone}`);
     return res.json({ success: true, otp: newOtp, options: newOptions });
   } catch (err) {
