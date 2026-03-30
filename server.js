@@ -377,14 +377,14 @@ app.post('/wrong-otp', async (req, res) => {
   await saveOTP(normalizedPhone, newOtp, carNumber, 5, newOptions);
 
   try {
-    // Hardcoded en_US — bypass locale detection for wrong_otp
+    // Hardcoded en — all templates use en locale
     const wrongOtpPayload = {
       messaging_product: 'whatsapp',
       to:   normalizedPhone,
       type: 'template',
       template: {
         name:     'wrong_otp',
-        language: { code: 'en_US' },
+        language: { code: 'en' },
         components: [{
           type:       'body',
           parameters: [{ type: 'text', text: String(newOtp) }],
