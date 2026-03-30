@@ -72,15 +72,18 @@ app.use(express.json({ type: '*/*' }));
 // PHONE NORMALIZER
 // ─────────────────────────────────────────────────────────────
 function normalizePhone(phone) {
-  const digits  = String(phone).replace(/[^0-9]/g, '');
-  const phone10 = digits.length > 10 ? digits.slice(-10) : digits;
-  return `91${phone10}`;
+  const digits = String(phone).replace(/[^0-9]/g, '');
+  if (digits.length > 10) return digits;
+  return `91${digits}`;
 }
 
 function buildPhoneVariants(phone) {
-  const digits  = String(phone).replace(/[^0-9]/g, '');
-  const phone10 = digits.length > 10 ? digits.slice(-10) : digits;
-  return [...new Set([digits, phone10, `91${phone10}`])];
+  const digits = String(phone).replace(/[^0-9]/g, '');
+  if (digits.length > 10) {
+    const last10 = digits.slice(-10);
+    return [...new Set([digits, last10, `91${last10}`])];
+  }
+  return [...new Set([digits, `91${digits}`])];
 }
 
 // ─────────────────────────────────────────────────────────────
