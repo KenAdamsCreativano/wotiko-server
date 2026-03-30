@@ -1,26 +1,5 @@
 /**
  * server.js — Wotiko Valet Backend + WhatsApp Bot
- *
- * EXACT MESSAGE FLOW:
- *
- *   MSG 1 → template: parked  [carNumber, driverName, slotMins]
- *     WHO:  Flutter → after driver taps Add Car + Firestore saved
- *     HAS:  "Retrieve Car" quick-reply button
- *
- *   MSG 2 → plain text OTP  (SERVER sends automatically)
- *     WHO:  Server → when guest taps "Retrieve Car" in WhatsApp
- *     TEXT: "On it! ...less than X mins... code: OTP"
- *     ALSO: Firestore → retrieve_requested + FCM push to driver
- *
- *   [Accept → CarDetailsScreen — NO message]
- *   [Verify → /get-otp returns circles — NO message]
- *
- *   MSG 3 → template: delivered  [carNumber, v2, v3, v4]
- *     WHO:  Server → when driver taps Deliver with correct OTP
- *     Full: "Drive safe, [carNumber]!
- *            Hope the food was exactly how you wanted it to be.
- *            [v2] [v3] about the [v4]
- *            You should try it next time in case you haven't already!"
  */
 
 const express = require('express');
@@ -30,7 +9,6 @@ const morgan  = require('morgan');
 const axios   = require('axios');
 require('dotenv').config();
 
-// ── Firebase ──────────────────────────────────────────────────
 const admin = require('firebase-admin');
 admin.initializeApp({
   credential: admin.credential.cert({
@@ -43,7 +21,6 @@ const db  = admin.firestore();
 const col = db.collection('parked_cars');
 console.log('✅ Firebase Admin initialized');
 
-// ── WhatsApp ──────────────────────────────────────────────────
 const WA_TOKEN    = process.env.WHATSAPP_ACCESS_TOKEN;
 const WA_PHONE_ID = process.env.WHATSAPP_PHONE_NUMBER_ID;
 const WA_VERIFY   = process.env.WEBHOOK_VERIFY_TOKEN || 'my-verify-token';
@@ -56,7 +33,35 @@ const WA_HEADERS  = () => ({
 const VENUE_NAME   = 'Wotiko Valet';
 const SLOT_MINUTES = { 'A': 5, 'B': 3, 'C': 6, 'D': 7, 'E': 8, 'OTHER': 10 };
 
-// ── Express ───────────────────────────────────────────────────
+// ── Farewell message variable pools ──────────────────────────
+const V1_OPTIONS = [
+  "Next time you're here,",
+  'On your next visit,',
+  "Next time, don't miss this -",
+  'Next time',
+  'For your next experience,',
+];
+
+const V2_OPTIONS = [
+  'Our team absolutely loves the',
+  'A team favourite is the',
+  'Our team is obsessed with the',
+  'Our team recommends the',
+  "Our team's top pick is the",
+];
+
+const V3_OPTIONS = [
+  'Truffle Garlic Fried Rice',
+  'Curry Butter Garlic Prawns',
+  'Dragon Chicken',
+  'Chicken Quesadillas',
+  'Pan Grilled Salmon',
+];
+
+function randomPick(arr) {
+  return arr[Math.floor(Math.random() * arr.length)];
+}
+
 const app = express();
 app.use(helmet({ contentSecurityPolicy: false }));
 app.use(cors({ origin: '*', methods: ['GET', 'POST', 'PATCH', 'DELETE'] }));
@@ -64,7 +69,7 @@ app.use(morgan('dev'));
 app.use(express.json({ type: '*/*' }));
 
 // ─────────────────────────────────────────────────────────────
-// PHONE NORMALIZER — always 91XXXXXXXXXX
+// PHONE NORMALIZER
 // ─────────────────────────────────────────────────────────────
 function normalizePhone(phone) {
   const digits  = String(phone).replace(/[^0-9]/g, '');
@@ -79,8 +84,7 @@ function buildPhoneVariants(phone) {
 }
 
 // ─────────────────────────────────────────────────────────────
-// OTP STORE — key = normalizePhone always
-// Stores otp + options so /get-otp can return circles to Flutter
+// OTP STORE
 // ─────────────────────────────────────────────────────────────
 const otpStore = new Map();
 
@@ -88,7 +92,7 @@ function saveOTP(phone, otp, carNumber, slotMins, options) {
   const key = normalizePhone(phone);
   otpStore.set(key, {
     otp, carNumber, slotMins, options,
-    expiresAt: Date.now() + 15 * 60 * 1000, // 15 min
+    expiresAt: Date.now() + 15 * 60 * 1000,
   });
   console.log(`💾 OTP saved | ${key} | ${otp}`);
 }
@@ -321,8 +325,7 @@ app.post('/send-messages', async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────
-// GET OTP — Flutter calls when driver taps Verify on CarDetailsScreen
-// Returns stored OTP + options (circles) — NO WhatsApp message sent
+// GET OTP — Flutter calls when driver taps Verify
 // ─────────────────────────────────────────────────────────────
 app.post('/get-otp', async (req, res) => {
   const { phone, carNumber } = req.body;
@@ -342,13 +345,43 @@ app.post('/get-otp', async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────
-// VERIFY OTP — Flutter calls when driver taps Deliver
-// 1. Validate OTP
-// 2. Send MSG 3: delivered template [carNumber, v2, v3, v4]
-// 3. Update Firestore → delivered
+// WRONG OTP — driver tapped wrong circle
+// 1. Generate fresh OTP + options
+// 2. Send wrong_otp template to guest with new code
+// 3. Save new OTP — replaces old one
+// ─────────────────────────────────────────────────────────────
+app.post('/wrong-otp', async (req, res) => {
+  const { phone, carNumber } = req.body;
+  if (!phone || !carNumber)
+    return res.status(400).json({ error: 'phone and carNumber required' });
+
+  const normalizedPhone = normalizePhone(phone);
+  const newOtp          = generateOTP();
+  const newOptions      = makeOptions(newOtp);
+
+  // Save new OTP — overwrites old one
+  saveOTP(normalizedPhone, newOtp, carNumber, 5, newOptions);
+
+  try {
+    // Template: "Looks like the code was entered incorrectly.
+    //            Please share this updated code with the driver: {{1}}"
+    await sendTemplateMessage(normalizedPhone, 'wrong_otp', [newOtp]);
+    console.log(`✅ Wrong OTP → new: ${newOtp} | ${normalizedPhone}`);
+    return res.json({ success: true, otp: newOtp, options: newOptions });
+  } catch (err) {
+    console.error('❌ /wrong-otp:', err.response?.data || err.message);
+    return res.status(500).json({
+      error: err.response?.data?.error?.message || err.message
+    });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────
+// VERIFY OTP — driver taps Deliver
+// Variables picked randomly from pools — Flutter values ignored
 // ─────────────────────────────────────────────────────────────
 app.post('/verify-otp', async (req, res) => {
-  const { phone, otp, docId, v2, v3, v4 } = req.body;
+  const { phone, otp, docId } = req.body;
   if (!phone || !otp)
     return res.status(400).json({ error: 'phone and otp required' });
 
@@ -360,10 +393,12 @@ app.post('/verify-otp', async (req, res) => {
 
   console.log(`✅ OTP verified | Car: ${result.carNumber}`);
 
-  // Defaults if driver left fields empty
-  const phrase    = v2 || 'For next time,';
-  const teamLine  = v3 || 'entire Team Wotiko is crazy';
-  const dish      = v4 || 'our special dish';
+  // Pick variables randomly from pools
+  const phrase   = randomPick(V1_OPTIONS);
+  const teamLine = randomPick(V2_OPTIONS);
+  const dish     = randomPick(V3_OPTIONS);
+
+  console.log(`🎲 Farewell vars → v1:"${phrase}" v2:"${teamLine}" v3:"${dish}"`);
 
   try {
     // MSG 3: delivered template
@@ -410,7 +445,7 @@ app.get('/webhook', (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────
-// WEBHOOK RECEIVE — guest taps Retrieve Car → MSG 2 auto
+// WEBHOOK RECEIVE
 // ─────────────────────────────────────────────────────────────
 app.post('/webhook', (req, res) => {
   res.status(200).send('OK');
@@ -452,12 +487,6 @@ async function processIncomingMessage(body) {
 
 // ─────────────────────────────────────────────────────────────
 // RETRIEVE CAR HANDLER
-// Guest taps Retrieve Car →
-//   1. Find car → get slot time
-//   2. Generate OTP + options → save under normalized phone
-//   3. Send MSG 2 plain text — EXACTLY ONCE
-//   4. Firestore → retrieve_requested
-//   5. FCM push to driver
 // ─────────────────────────────────────────────────────────────
 async function handleRetrieveCar(from) {
   console.log(`🚗 Retrieve from: ${from}`);
@@ -487,12 +516,10 @@ async function handleRetrieveCar(from) {
     const area      = (data.parking_area || 'A').toUpperCase();
     const slotMins  = SLOT_MINUTES[area] ?? 5;
 
-    // Generate OTP + options, save under normalized key
     const otp     = generateOTP();
     const options = makeOptions(otp);
     saveOTP(normalizedFrom, otp, carNumber, slotMins, options);
 
-    // MSG 2 — sent ONCE here, never again
     const msg =
       `On it!\n` +
       `Your car should be at the main entrance in less than ${slotMins} mins.\n\n` +
@@ -503,14 +530,12 @@ async function handleRetrieveCar(from) {
     await sendTextMessage(normalizedFrom, msg);
     console.log(`✅ MSG 2 → ${normalizedFrom} | OTP:${otp} | ${slotMins}min`);
 
-    // Firestore
     await matchedDoc.ref.update({
       status:                'retrieve_requested',
       Retrieve_request_time: admin.firestore.FieldValue.serverTimestamp(),
     });
     console.log(`✅ Firestore: retrieve_requested | ${carNumber} | ${carId}`);
 
-    // FCM
     await sendFCMNotification(carNumber, carId);
 
   } catch (err) {
@@ -519,7 +544,7 @@ async function handleRetrieveCar(from) {
 }
 
 // ─────────────────────────────────────────────────────────────
-// FCM — data-only push
+// FCM
 // ─────────────────────────────────────────────────────────────
 async function sendFCMNotification(carNumber, carId) {
   try {
@@ -561,6 +586,7 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 http://139.59.75.67:${PORT}`);
   console.log(`📲 /send-messages → MSG 1 parked template`);
   console.log(`🔑 /get-otp       → get circles, no WA msg`);
-  console.log(`✅ /verify-otp    → MSG 3 delivered + Firestore`);
+  console.log(`⚠️  /wrong-otp    → new OTP + wrong_otp template`);
+  console.log(`✅ /verify-otp    → MSG 3 delivered (random vars) + Firestore`);
   console.log(`🔗 /webhook       → MSG 2 auto on Retrieve Car\n`);
 });
