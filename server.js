@@ -233,7 +233,7 @@ function startWorkers() {
         `Looks like the code was entered incorrectly.
 
 ` +
-        `Please share this updated code with the driver:
+        `Please share this new code with the driver:
 *${job.otp}*`;
       await sendTextMessage(job.phone, text);
       console.log(`✅ [Q] Wrong OTP sent | ${job.phone} | ${job.otp}`);
