@@ -15,7 +15,7 @@
  *   [Accept → CarDetailsScreen — NO message]
  *   [Verify → /get-otp returns circles — NO message]
  *
- *   MSG 3 → template: end  [carNumber, phrase, dish]
+ *   MSG 3 → template: test_end  [carNumber]
  *     WHO:  Server → when driver taps Deliver with correct OTP
  *
  * SECURITY:
@@ -58,35 +58,11 @@ const WA_HEADERS  = () => ({
 });
 
 const VENUE_NAME   = 'Wotiko Valet';
-const SLOT_MINUTES = { 'A': 2, 'B': 2, 'C': 3, 'D': 4, 'E': 5, 'OTHER': 6 };
+const SLOT_MINUTES = { 'A': 10, 'B': 2, 'C': 3, 'D': 4, 'E': 5, 'OTHER': 6 };
 
-// ── Farewell message variable pools ──────────────────────────
-// Template: end
-// {{1}}=carNumber, {{2}}=phrase, {{3}}=*dish* (bold in WhatsApp)
-const PHRASE_OPTIONS = [
-  'On your next visit, you should try the',
-  'Our team highly recommends the',
-  'A favourite among our team is the',
-  'Many guests love the',
-  'One of our top picks is the',
-  'You might enjoy the',
-  "Don't miss out on the",
-  'A must-try from our kitchen is the',
-  "One dish you shouldn't miss is the",
-  'Something worth trying next time is the',
-];
-
-const DISH_OPTIONS = [
-  '*Truffle Garlic Fried Rice*',
-  '*Curry Butter Garlic Prawns*',
-  '*Dragon Chicken*',
-  '*Chicken Quesadillas*',
-  '*Pan Grilled Salmon*',
-];
-
-function randomPick(arr) {
-  return arr[Math.floor(Math.random() * arr.length)];
-}
+// ── Farewell template ────────────────────────────────────────
+// Template: test_end
+// {{1}}=carNumber only
 
 // ─────────────────────────────────────────────────────────────
 // RABBITMQ
@@ -206,13 +182,13 @@ function startWorkers() {
     }
   }, { noAck: false });
 
-  // MSG 3: end template
+  // MSG 3: test_end template
   mqChannel.consume(QUEUES.DELIVERED, async (msg) => {
     if (!msg) return;
     const job     = JSON.parse(msg.content.toString());
     const retries = msg.properties.headers?.['x-retry-count'] || 0;
     try {
-      await sendTemplateMessage(job.phone, 'end', [job.carNumber, job.phrase, job.dish]);
+      await sendTemplateMessage(job.phone, 'test_end', [job.carNumber]);
       console.log(`✅ [Q] MSG 3 delivered sent | ${job.phone}`);
       mqChannel.ack(msg);
     } catch (err) {
@@ -233,7 +209,7 @@ function startWorkers() {
         `Looks like the code was entered incorrectly.
 
 ` +
-        `Please share this new code with the driver:
+        `Please share this updated code with the driver:
 *${job.otp}*`;
       await sendTextMessage(job.phone, text);
       console.log(`✅ [Q] Wrong OTP sent | ${job.phone} | ${job.otp}`);
@@ -383,7 +359,7 @@ function makeOptions(otp) {
 // ─────────────────────────────────────────────────────────────
 const templateLocaleCache = new Map();
 templateLocaleCache.set('confirm_parked', 'en');
-templateLocaleCache.set('end',            'en');
+templateLocaleCache.set('test_end', 'en');
 const LOCALE_CANDIDATES = ['en', 'en_US', 'en_GB'];
 
 async function sendTemplateMessage(to, templateName, bodyParams = []) {
@@ -639,17 +615,13 @@ app.post('/verify-otp', async (req, res) => {
 
   console.log(`✅ OTP verified | Car: ${result.carNumber}`);
 
-  const phrase = randomPick(PHRASE_OPTIONS);
-  const dish   = randomPick(DISH_OPTIONS);
-  console.log(`🎲 Farewell vars → phrase:"${phrase}" dish:"${dish}"`);
-
   try {
-    // MSG 3: end template — queue with direct fallback
+    // MSG 3: test_end template — queue with direct fallback
     const queued = publish(QUEUES.DELIVERED, {
-      phone: normalizePhone(phone), carNumber: result.carNumber, phrase, dish,
+      phone: normalizePhone(phone), carNumber: result.carNumber,
     });
     if (!queued) {
-      await sendTemplateMessage(normalizePhone(phone), 'end', [result.carNumber, phrase, dish]);
+      await sendTemplateMessage(normalizePhone(phone), 'test_end', [result.carNumber]);
     }
     console.log(`✅ MSG 3 queued/sent | ${normalizePhone(phone)} | Car: ${result.carNumber}`);
 
