@@ -141,7 +141,7 @@ function startWorkers() {
     const retries = msg.properties.headers?.['x-retry-count'] || 0;
     try {
       await sendTemplateMessage(job.phone, 'confirm_parked', [
-        job.carNumber, 'Madras Square, Chennai', job.driverName, String(job.slotMins),
+        job.carNumber, 'Creativano', job.driverName, String(job.slotMins),
       ]);
       console.log(`✅ [Q] MSG 1 sent | ${job.phone}`);
       mqChannel.ack(msg);
