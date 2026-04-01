@@ -58,7 +58,7 @@ const WA_HEADERS  = () => ({
 });
 
 const VENUE_NAME   = 'Wotiko Valet';
-const SLOT_MINUTES = { 'A': 10, 'B': 2, 'C': 3, 'D': 4, 'E': 5, 'OTHER': 6 };
+const SLOT_MINUTES = { 'A': 2, 'B': 2, 'C': 3, 'D': 4, 'E': 5, 'OTHER': 6 };
 
 // ── Farewell template ────────────────────────────────────────
 // Template: test_end
@@ -141,7 +141,7 @@ function startWorkers() {
     const retries = msg.properties.headers?.['x-retry-count'] || 0;
     try {
       await sendTemplateMessage(job.phone, 'confirm_parked', [
-        job.carNumber, 'Creativano', job.driverName, String(job.slotMins),
+        job.carNumber, 'Madras Square, Chennai', job.driverName, String(job.slotMins),
       ]);
       console.log(`✅ [Q] MSG 1 sent | ${job.phone}`);
       mqChannel.ack(msg);
@@ -770,10 +770,13 @@ async function handleRetrieveCar(from) {
 // ─────────────────────────────────────────────────────────────
 async function sendFCMNotification(carNumber, carId) {
   try {
-    const snap = await db.collection('fcm_tokens').get();
-    if (snap.empty) { console.log('⚠️ No FCM tokens'); return; }
-    const tokens = snap.docs.map(d => d.data().token).filter(Boolean);
-    if (!tokens.length) return;
+    // FCM tokens stored in drivers collection — no separate fcm_tokens collection
+    const snap = await db.collection('drivers').get();
+    if (snap.empty) { console.log('⚠️ No drivers found'); return; }
+    const tokens = snap.docs
+      .map(d => d.data().fcmToken)
+      .filter(Boolean);
+    if (!tokens.length) { console.log('⚠️ No FCM tokens in drivers collection'); return; }
 
     const response = await admin.messaging().sendEachForMulticast({
       data: {
