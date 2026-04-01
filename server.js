@@ -779,6 +779,13 @@ async function sendFCMNotification(carNumber, carId) {
     if (!tokens.length) { console.log('⚠️ No FCM tokens in drivers collection'); return; }
 
     const response = await admin.messaging().sendEachForMulticast({
+      // notification block — FCM shows this directly when app is CLOSED
+      // This is what makes notifications work when app is killed
+      notification: {
+        title: '🚗 Car Retrieve Request',
+        body:  `Vehicle ${carNumber} — guest is waiting. Tap to respond.`,
+      },
+      // data block — Flutter reads this in foreground + background handlers
       data: {
         type:      'retrieve_requested',
         carNumber: String(carNumber),
@@ -786,10 +793,37 @@ async function sendFCMNotification(carNumber, carId) {
         title:     'Car Retrieve Request',
         body:      `Vehicle ${carNumber} — guest is waiting`,
       },
-      android: { priority: 'high', ttl: 60000 },
+      android: {
+        priority: 'high',
+        ttl:      60000,
+        notification: {
+          channelId:   'wotiko_retrieve_v3',  // must match Flutter channel
+          priority:    'max',
+          defaultSound: false,
+          sound:       'retrival_ringtone_wotiko',
+          defaultVibrateTimings: false,
+          vibrateTimingsMillis:  [0, 800, 200, 800, 200, 800, 200, 800],
+          notificationPriority:  'PRIORITY_MAX',
+          visibility:  'PUBLIC',
+          clickAction: 'FLUTTER_NOTIFICATION_CLICK',
+        },
+      },
       apns: {
-        headers: { 'apns-priority': '10', 'apns-push-type': 'background' },
-        payload: { aps: { 'content-available': 1 } },
+        headers: {
+          'apns-priority':  '10',
+          'apns-push-type': 'alert',
+        },
+        payload: {
+          aps: {
+            alert: {
+              title: '🚗 Car Retrieve Request',
+              body:  `Vehicle ${carNumber} — guest is waiting. Tap to respond.`,
+            },
+            sound:             'retrival_ringtone_wotiko.mp3',
+            'content-available': 1,
+            'interruption-level': 'critical',
+          },
+        },
       },
       tokens,
     });
