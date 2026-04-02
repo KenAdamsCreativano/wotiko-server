@@ -2,11 +2,15 @@
  * server.js — Wotiko Valet Backend
  *
  * MESSAGE FLOW:
- *   MSG1 confirm_parked  → Flutter after park    {{1}}=carNumber {{2}}=driverName {{3}}=slotMins
- *   MSG2 retrieve        → Driver accepts        {{1}}=driverName {{2}}=slotMins
+ *   MSG1 confirm_parked  → Flutter after park    {{1}}=carNumber {{2}}=venueName {{3}}=driverName {{4}}=slotMins
+ *   MSG2 retrieve        → Driver accepts        {{1}}=driverName {{2}}=remainingMins  ← fixed: uses remaining time, not raw slotMins
  *   MSG4 skip            → Driver skips          {{1}}=totalWait
  *   MSG5 cancel          → Guest cancels         no vars
  *   MSG6 end             → Driver delivers       {{1}}=carNumber {{2}}=venue {{3}}=phrase {{4}}=dish
+ *
+ * FIX: When a driver accepts after one or more skips, MSG2 now sends the
+ *      *remaining* minutes (slotMins − elapsed since Retrieve_request_time),
+ *      floored to a minimum of 1. Flutter must pass docId in the accept call.
  */
 
 const express   = require('express');
@@ -121,11 +125,21 @@ function startWorkers() {
     }, { noAck: false });
   };
 
+  // MSG1: confirm_parked — {{1}}=carNumber {{2}}=venueName {{3}}=driverName {{4}}=slotMins
   worker(QUEUES.PARKED,   j => sendTemplateMessage(j.phone, 'confirm_parked', [j.carNumber, VENUE_NAME, j.driverName, String(j.slotMins)]));
-  worker(QUEUES.RETRIEVE, j => sendTemplateMessage(j.phone, 'retrieve',       [j.driverName, String(j.slotMins)]));
-  worker(QUEUES.SKIP,     j => sendTemplateMessage(j.phone, 'skip',           [String(j.totalWait)]), 3, 15000);
-  worker(QUEUES.CANCEL,   j => sendTemplateMessage(j.phone, 'cancel',         []), 3, 15000);
-  worker(QUEUES.END,      j => sendTemplateMessage(j.phone, 'end',            [j.carNumber, VENUE_NAME, j.phrase, j.dish]));
+
+  // MSG2: retrieve — {{1}}=driverName {{2}}=remainingMins (pre-calculated before enqueue)
+  worker(QUEUES.RETRIEVE, j => sendTemplateMessage(j.phone, 'retrieve', [j.driverName, String(j.remainingMins)]));
+
+  // MSG4: skip — {{1}}=totalWait
+  worker(QUEUES.SKIP,     j => sendTemplateMessage(j.phone, 'skip',    [String(j.totalWait)]), 3, 15000);
+
+  // MSG5: cancel — no vars
+  worker(QUEUES.CANCEL,   j => sendTemplateMessage(j.phone, 'cancel',  []), 3, 15000);
+
+  // MSG6: end — {{1}}=carNumber {{2}}=venueName {{3}}=phrase {{4}}=dish
+  worker(QUEUES.END,      j => sendTemplateMessage(j.phone, 'end',     [j.carNumber, VENUE_NAME, j.phrase, j.dish]));
+
   worker(QUEUES.FCM,      j => sendFCMNotification(j.carNumber, j.carId), 2, 10000);
 
   console.log('✅ All workers started');
@@ -194,7 +208,6 @@ async function sendTemplateMessage(to, name, params = []) {
       return res.data;
     } catch (e) {
       if (e.response?.data?.error?.code === 132001) { lastErr = e; continue; }
-      // Log full error for debugging
       console.error(`❌ Template ${name} failed:`, JSON.stringify(e.response?.data || e.message));
       throw e;
     }
@@ -205,6 +218,24 @@ async function sendTemplateMessage(to, name, params = []) {
 async function sendTextMessage(to, text) {
   const res = await axios.post(WA_BASE, { messaging_product: 'whatsapp', to, type: 'text', text: { body: text } }, { headers: WA_HEADERS() });
   return res.data;
+}
+
+// ── Remaining time helper ─────────────────────────────────────
+/**
+ * Calculates how many minutes are left for the driver to retrieve the car.
+ *
+ * slotMins  = total allowed minutes for the parking area (e.g. area C = 3 mins)
+ * elapsed   = minutes since the guest first tapped "Retrieve Car"
+ * remaining = slotMins − elapsed, floored to a minimum of 1
+ *
+ * This ensures MSG2 always shows an honest remaining time even if one or
+ * more drivers skipped before this driver accepted.
+ */
+function calcRemainingMins(retrieveRequestTime, slotMins) {
+  if (!retrieveRequestTime) return slotMins;
+  const elapsedMs   = Date.now() - retrieveRequestTime.toDate().getTime();
+  const elapsedMins = Math.floor(elapsedMs / 60000);
+  return Math.max(1, slotMins - elapsedMins);
 }
 
 // ── Firestore helpers ─────────────────────────────────────────
@@ -291,31 +322,103 @@ app.delete('/api/parking/:id', async (req, res) => {
   } catch (e) { res.status(500).json({ success: false, error: e.message }); }
 });
 
-// ── Send messages (Flutter calls for MSG1, MSG2, MSG4) ────────
+// ── Send messages (Flutter calls for MSG1, MSG2, MSG4, MSG5) ─────────────────
+//
+// For MSG2 (retrieve / driver accepts), Flutter MUST now send:
+//   { phone, type: 'template', templateName: 'retrieve', docId, driverName }
+//
+// The server reads Retrieve_request_time and parking_area from Firestore,
+// calculates remaining minutes, and uses that in MSG2 instead of raw slotMins.
+// Flutter no longer needs to calculate or pass slotMins for the accept case.
+//
 app.post('/send-messages', async (req, res) => {
-  const { phone, type, message, templateName, bodyParams } = req.body;
+  const { phone, type, message, templateName, bodyParams, docId, driverName } = req.body;
   if (!phone) return res.status(400).json({ error: 'phone required' });
+
   try {
-    if (type === 'text') { await sendTextMessage(phone, message); return res.json({ success: true }); }
-    if (type === 'template') {
-      let queued = false;
-      if (templateName === 'confirm_parked') {
-        queued = publish(QUEUES.PARKED, { phone, carNumber: bodyParams?.[0]||'', driverName: bodyParams?.[1]||'', slotMins: bodyParams?.[2]||5 });
-        // Direct fallback — must include VENUE_NAME as {{2}}
-        if (!queued) await sendTemplateMessage(phone, 'confirm_parked', [bodyParams?.[0]||'', VENUE_NAME, bodyParams?.[1]||'', String(bodyParams?.[2]||5)]);
-      } else if (templateName === 'retrieve') {
-        queued = publish(QUEUES.RETRIEVE, { phone, driverName: bodyParams?.[0]||'', slotMins: bodyParams?.[1]||5 });
-        if (!queued) await sendTemplateMessage(phone, 'retrieve', [bodyParams?.[0]||'', String(bodyParams?.[1]||5)]);
-      } else if (templateName === 'skip') {
-        queued = publish(QUEUES.SKIP, { phone, totalWait: bodyParams?.[0]||6 });
-        if (!queued) await sendTemplateMessage(phone, 'skip', [String(bodyParams?.[0]||6)]);
-      } else if (templateName === 'cancel') {
-        queued = publish(QUEUES.CANCEL, { phone });
-        if (!queued) await sendTemplateMessage(phone, 'cancel', []);
-      }
+    if (type === 'text') {
+      await sendTextMessage(phone, message);
       return res.json({ success: true });
     }
-    res.status(400).json({ error: 'Unknown type' });
+
+    if (type === 'template') {
+
+      // ── MSG1: confirm_parked ────────────────────────────────
+      if (templateName === 'confirm_parked') {
+        // bodyParams: [carNumber, driverName, slotMins]
+        const queued = publish(QUEUES.PARKED, {
+          phone,
+          carNumber:  bodyParams?.[0] || '',
+          driverName: bodyParams?.[1] || '',
+          slotMins:   bodyParams?.[2] || 5,
+        });
+        if (!queued) {
+          await sendTemplateMessage(phone, 'confirm_parked', [
+            bodyParams?.[0] || '',
+            VENUE_NAME,
+            bodyParams?.[1] || '',
+            String(bodyParams?.[2] || 5),
+          ]);
+        }
+        return res.json({ success: true });
+      }
+
+      // ── MSG2: retrieve (driver accepts) ─────────────────────
+      // Requires docId and driverName in the request body.
+      // Server fetches the doc, calculates remaining mins, sends MSG2.
+      if (templateName === 'retrieve') {
+        if (!docId || !driverName) {
+          return res.status(400).json({ error: 'docId and driverName required for retrieve' });
+        }
+
+        // Fetch the parking doc to get area + retrieve request time
+        const doc = await col.doc(docId).get();
+        if (!doc.exists) {
+          return res.status(404).json({ error: 'Parking doc not found' });
+        }
+
+        const data         = doc.data();
+        const area         = (data.parking_area || 'OTHER').toUpperCase();
+        const slotMins     = SLOT_MINUTES[area] ?? SLOT_MINUTES['OTHER'];
+        const remainingMins = calcRemainingMins(data.Retrieve_request_time, slotMins);
+
+        console.log(`🕐 Accept | area=${area} slotMins=${slotMins} remaining=${remainingMins}min | ${docId}`);
+
+        // Update Firestore: accepted + accepting driver name
+        await col.doc(docId).update({ status: 'accepted', driver_name: driverName });
+
+        // Send MSG2 with honest remaining time
+        const queued = publish(QUEUES.RETRIEVE, {
+          phone,
+          driverName,
+          remainingMins,
+        });
+        if (!queued) {
+          await sendTemplateMessage(phone, 'retrieve', [driverName, String(remainingMins)]);
+        }
+
+        return res.json({ success: true, remainingMins });
+      }
+
+      // ── MSG4: skip ──────────────────────────────────────────
+      if (templateName === 'skip') {
+        // bodyParams: [totalWait]  — Flutter tracks cumulative wait across skips
+        const queued = publish(QUEUES.SKIP, { phone, totalWait: bodyParams?.[0] || 6 });
+        if (!queued) {
+          await sendTemplateMessage(phone, 'skip', [String(bodyParams?.[0] || 6)]);
+        }
+        return res.json({ success: true });
+      }
+
+      // ── MSG5: cancel ────────────────────────────────────────
+      if (templateName === 'cancel') {
+        const queued = publish(QUEUES.CANCEL, { phone });
+        if (!queued) await sendTemplateMessage(phone, 'cancel', []);
+        return res.json({ success: true });
+      }
+    }
+
+    res.status(400).json({ error: 'Unknown type or templateName' });
   } catch (e) {
     console.error('❌ /send-messages:', e.message);
     res.status(500).json({ error: e.message });
@@ -381,7 +484,7 @@ async function processWebhook(body) {
     }
     if (msg.type === 'interactive') {
       const id = msg.interactive?.button_reply?.id || '';
-      if (id === 'retrieve_car')    await handleRetrieveCar(from);
+      if (id === 'retrieve_car')     await handleRetrieveCar(from);
       if (id === 'cancel_retrieval') await handleCancelRetrieval(from);
     }
   } catch (e) { console.error('💥 Webhook:', e.message); }
@@ -390,11 +493,9 @@ async function processWebhook(body) {
 // ── Retrieve Car ──────────────────────────────────────────────
 async function handleRetrieveCar(from) {
   console.log(`🚗 Retrieve: ${from}`);
-  const nFrom    = normalizePhone(from);
   const variants = buildPhoneVariants(from);
   try {
     let matchedDoc = null;
-    // Search parked first, then cancelled (in case guest taps Retrieve before 5s reset)
     for (const ph of variants) {
       for (const st of ['parked', 'cancelled']) {
         const snap = await col.where('guest_phone','==',ph).where('status','==',st).limit(1).get();
@@ -406,10 +507,8 @@ async function handleRetrieveCar(from) {
       await sendTextMessage(from, 'We could not find an active parking record. Please contact our valet team.');
       return;
     }
-    const data     = matchedDoc.data();
-    const carId    = matchedDoc.id;
-    const area     = (data.parking_area || 'A').toUpperCase();
-    const slotMins = SLOT_MINUTES[area] ?? 5;
+    const data  = matchedDoc.data();
+    const carId = matchedDoc.id;
 
     // Update Firestore → retrieve_requested
     await matchedDoc.ref.update({
@@ -418,7 +517,7 @@ async function handleRetrieveCar(from) {
     });
     console.log(`✅ retrieve_requested | ${data.vehicle_number} | ${carId}`);
 
-    // FCM push to driver
+    // FCM push to all drivers
     const fcmQueued = publish(QUEUES.FCM, { carNumber: data.vehicle_number, carId });
     if (!fcmQueued) await sendFCMNotification(data.vehicle_number, carId);
 
@@ -446,7 +545,7 @@ async function handleCancelRetrieval(from) {
     // Set cancelled so Flutter detects it → shows CancelRetrieveScreen
     await matchedDoc.ref.update({ status: 'cancelled' });
 
-    // 5 seconds later → set back to parked so guest can retrieve again
+    // 5 seconds later → reset to parked so guest can retrieve again
     setTimeout(async () => {
       try { await matchedDoc.ref.update({ status: 'parked' }); console.log(`✅ Reset to parked | ${carId}`); }
       catch (e) { console.error('❌ Reset parked:', e.message); }
