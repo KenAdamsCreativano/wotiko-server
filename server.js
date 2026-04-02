@@ -394,9 +394,13 @@ async function handleRetrieveCar(from) {
   const variants = buildPhoneVariants(from);
   try {
     let matchedDoc = null;
+    // Search parked first, then cancelled (in case guest taps Retrieve before 5s reset)
     for (const ph of variants) {
-      const snap = await col.where('guest_phone','==',ph).where('status','==','parked').limit(1).get();
-      if (!snap.empty) { matchedDoc = snap.docs[0]; break; }
+      for (const st of ['parked', 'cancelled']) {
+        const snap = await col.where('guest_phone','==',ph).where('status','==',st).limit(1).get();
+        if (!snap.empty) { matchedDoc = snap.docs[0]; break; }
+      }
+      if (matchedDoc) break;
     }
     if (!matchedDoc) {
       await sendTextMessage(from, 'We could not find an active parking record. Please contact our valet team.');
@@ -469,7 +473,7 @@ async function sendFCMNotification(carNumber, carId) {
       android: {
         priority: 'high', ttl: 60000,
         notification: {
-          channelId: 'wotiko_retrieve_v3', priority: 'max',
+          channelId: 'wotiko_retrieve_v4', priority: 'max',
           defaultSound: false, sound: 'retrival_ringtone_wotiko',
           defaultVibrateTimings: false, vibrateTimingsMillis: [0,800,200,800,200,800,200,800],
           visibility: 'PUBLIC', clickAction: 'FLUTTER_NOTIFICATION_CLICK',
