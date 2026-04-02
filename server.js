@@ -121,7 +121,7 @@ function startWorkers() {
     }, { noAck: false });
   };
 
-  worker(QUEUES.PARKED,   j => sendTemplateMessage(j.phone, 'confirm_parked', [j.carNumber, j.driverName, String(j.slotMins)]));
+  worker(QUEUES.PARKED,   j => sendTemplateMessage(j.phone, 'confirm_parked', [j.carNumber, VENUE_NAME, j.driverName, String(j.slotMins)]));
   worker(QUEUES.RETRIEVE, j => sendTemplateMessage(j.phone, 'retrieve',       [j.driverName, String(j.slotMins)]));
   worker(QUEUES.SKIP,     j => sendTemplateMessage(j.phone, 'skip',           [String(j.totalWait)]), 3, 15000);
   worker(QUEUES.CANCEL,   j => sendTemplateMessage(j.phone, 'cancel',         []), 3, 15000);
@@ -297,7 +297,7 @@ app.post('/send-messages', async (req, res) => {
     if (type === 'text') { await sendTextMessage(phone, message); return res.json({ success: true }); }
     if (type === 'template') {
       let queued = false;
-      if      (templateName === 'confirm_parked') queued = publish(QUEUES.PARKED,   { phone, carNumber: bodyParams?.[0]||'', driverName: bodyParams?.[1]||'', slotMins: bodyParams?.[2]||5 });
+      if      (templateName === 'confirm_parked') queued = publish(QUEUES.PARKED,   { phone, carNumber: bodyParams?.[0]||'', driverName: bodyParams?.[1]||'', slotMins: bodyParams?.[2]||5 }); // location (VENUE_NAME) added in worker
       else if (templateName === 'retrieve')       queued = publish(QUEUES.RETRIEVE, { phone, driverName: bodyParams?.[0]||'', slotMins: bodyParams?.[1]||5 });
       else if (templateName === 'skip')           queued = publish(QUEUES.SKIP,     { phone, totalWait: bodyParams?.[0]||6 });
       else if (templateName === 'cancel')         queued = publish(QUEUES.CANCEL,   { phone });
