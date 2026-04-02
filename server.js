@@ -299,11 +299,20 @@ app.post('/send-messages', async (req, res) => {
     if (type === 'text') { await sendTextMessage(phone, message); return res.json({ success: true }); }
     if (type === 'template') {
       let queued = false;
-      if      (templateName === 'confirm_parked') queued = publish(QUEUES.PARKED,   { phone, carNumber: bodyParams?.[0]||'', driverName: bodyParams?.[1]||'', slotMins: bodyParams?.[2]||5 }); // location (VENUE_NAME) added in worker
-      else if (templateName === 'retrieve')       queued = publish(QUEUES.RETRIEVE, { phone, driverName: bodyParams?.[0]||'', slotMins: bodyParams?.[1]||5 });
-      else if (templateName === 'skip')           queued = publish(QUEUES.SKIP,     { phone, totalWait: bodyParams?.[0]||6 });
-      else if (templateName === 'cancel')         queued = publish(QUEUES.CANCEL,   { phone });
-      if (!queued) await sendTemplateMessage(phone, templateName, bodyParams || []);
+      if (templateName === 'confirm_parked') {
+        queued = publish(QUEUES.PARKED, { phone, carNumber: bodyParams?.[0]||'', driverName: bodyParams?.[1]||'', slotMins: bodyParams?.[2]||5 });
+        // Direct fallback — must include VENUE_NAME as {{2}}
+        if (!queued) await sendTemplateMessage(phone, 'confirm_parked', [bodyParams?.[0]||'', VENUE_NAME, bodyParams?.[1]||'', String(bodyParams?.[2]||5)]);
+      } else if (templateName === 'retrieve') {
+        queued = publish(QUEUES.RETRIEVE, { phone, driverName: bodyParams?.[0]||'', slotMins: bodyParams?.[1]||5 });
+        if (!queued) await sendTemplateMessage(phone, 'retrieve', [bodyParams?.[0]||'', String(bodyParams?.[1]||5)]);
+      } else if (templateName === 'skip') {
+        queued = publish(QUEUES.SKIP, { phone, totalWait: bodyParams?.[0]||6 });
+        if (!queued) await sendTemplateMessage(phone, 'skip', [String(bodyParams?.[0]||6)]);
+      } else if (templateName === 'cancel') {
+        queued = publish(QUEUES.CANCEL, { phone });
+        if (!queued) await sendTemplateMessage(phone, 'cancel', []);
+      }
       return res.json({ success: true });
     }
     res.status(400).json({ error: 'Unknown type' });
