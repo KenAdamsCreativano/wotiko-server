@@ -194,6 +194,8 @@ async function sendTemplateMessage(to, name, params = []) {
       return res.data;
     } catch (e) {
       if (e.response?.data?.error?.code === 132001) { lastErr = e; continue; }
+      // Log full error for debugging
+      console.error(`❌ Template ${name} failed:`, JSON.stringify(e.response?.data || e.message));
       throw e;
     }
   }
