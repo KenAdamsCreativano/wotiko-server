@@ -747,29 +747,20 @@ async function sendFCMNotification(carNumber, carId) {
     if (!tokens.length) { console.log('⚠️ No FCM tokens'); return; }
 
     const res = await admin.messaging().sendEachForMulticast({
-      // DATA ONLY — no notification block
-      // This ensures _onBackgroundMessage ALWAYS runs (foreground + background + killed)
-      // _onBackgroundMessage shows the notification with custom channel (sound + vibration)
-      // If notification block is present, Android shows it directly and skips the handler
+      // data block — native WotikoFirebaseMessagingService reads carNumber + carId
+      // and shows full screen notification with custom sound + vibration
       data: {
         type:      'retrieve_requested',
         carNumber: String(carNumber),
         carId:     String(carId),
       },
       android: {
-        priority: 'high',  // MUST be 'high' to wake device and run background handler
+        priority: 'high',  // MUST be high — wakes device even when killed
         ttl:      60000,
       },
       apns: {
-        headers: {
-          'apns-priority':  '10',
-          'apns-push-type': 'background',
-        },
-        payload: {
-          aps: {
-            'content-available': 1,  // wakes iOS background handler
-          },
-        },
+        headers: { 'apns-priority': '10', 'apns-push-type': 'background' },
+        payload: { aps: { 'content-available': 1 } },
       },
       tokens,
     });
