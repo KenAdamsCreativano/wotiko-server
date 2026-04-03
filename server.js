@@ -747,42 +747,27 @@ async function sendFCMNotification(carNumber, carId) {
     if (!tokens.length) { console.log('⚠️ No FCM tokens'); return; }
 
     const res = await admin.messaging().sendEachForMulticast({
-      // notification block — shows when app is CLOSED (system handles it)
-      notification: {
-        title: '🚗 Car Retrieve Request',
-        body:  `Vehicle ${carNumber} — guest is waiting`,
-      },
-      // data block — Flutter reads in foreground + background handlers
+      // DATA ONLY — no notification block
+      // This ensures _onBackgroundMessage ALWAYS runs (foreground + background + killed)
+      // _onBackgroundMessage shows the notification with custom channel (sound + vibration)
+      // If notification block is present, Android shows it directly and skips the handler
       data: {
         type:      'retrieve_requested',
         carNumber: String(carNumber),
         carId:     String(carId),
       },
       android: {
-        priority: 'high',
+        priority: 'high',  // MUST be 'high' to wake device and run background handler
         ttl:      60000,
-        notification: {
-          channelId:             'wotiko_retrieve_v4',
-          priority:              'max',
-          defaultSound:          false,
-          sound:                 'retrival_ringtone_wotiko',
-          defaultVibrateTimings: false,
-          vibrateTimingsMillis:  [0, 800, 200, 800, 200, 800],
-          visibility:            'PUBLIC',
-          clickAction:           'FLUTTER_NOTIFICATION_CLICK',
-        },
       },
       apns: {
-        headers: { 'apns-priority': '10', 'apns-push-type': 'alert' },
+        headers: {
+          'apns-priority':  '10',
+          'apns-push-type': 'background',
+        },
         payload: {
           aps: {
-            alert: {
-              title: '🚗 Car Retrieve Request',
-              body:  `Vehicle ${carNumber} — guest is waiting`,
-            },
-            sound:               'retrival_ringtone_wotiko.mp3',
-            'content-available': 1,
-            'interruption-level': 'critical',
+            'content-available': 1,  // wakes iOS background handler
           },
         },
       },
