@@ -209,11 +209,24 @@ app.use(helmet({ contentSecurityPolicy: false }));
 app.use(cors({ origin: '*', methods: ['GET','POST','PATCH','DELETE'] }));
 app.use(morgan('dev'));
 app.use(express.json({ type: '*/*' }));
+// ── Rate limiting ────────────────────────────────────────────
+// Only rate limit UNAUTHENTICATED requests (no valid API key)
+// Authenticated drivers (with API key) have no limit — supports unlimited cars
 app.use(rateLimit({
   windowMs: 15 * 60 * 1000,
-  max:      100,
+  max:      50,   // 50 requests per 15min for unauthenticated — blocks bots
   message:  { error: 'Too many requests' },
-  skip:     req => req.path === '/webhook',
+  skip: (req) => {
+    // Skip rate limit for:
+    // 1. Webhook (WhatsApp callbacks)
+    // 2. Health check
+    // 3. Any request with valid API key (authenticated drivers)
+    if (req.path === '/webhook') return true;
+    if (req.path === '/')        return true;
+    const key = req.headers['x-api-key'];
+    if (key && key === process.env.API_SECRET_KEY) return true;
+    return false;
+  },
 }));
 
 // Block attack paths
@@ -238,14 +251,21 @@ app.use((req, res, next) => {
 // ── Phone helpers ─────────────────────────────────────────────
 function normalizePhone(p) {
   const d = String(p).replace(/[^0-9]/g, '');
-  return d.length > 10 ? d : `91${d}`;
+  // If already has country code (more than 10 digits), use as is
+  // Otherwise assume India (+91) as this app is India-based
+  if (d.length === 10) return `91${d}`;  // legacy Indian 10-digit only
+  return d;                                 // already has country code
 }
+
 function buildPhoneVariants(p) {
   const d = String(p).replace(/[^0-9]/g, '');
   if (d.length > 10) {
-    const l = d.slice(-10);
-    return [...new Set([d, l, `91${l}`])];
+    // Has country code — search exact + last 10 digits + 91+last10
+    const last10 = d.slice(-10);
+    const cc     = d.slice(0, d.length - 10); // country code digits
+    return [...new Set([d, last10, `91${last10}`, `${cc}${last10}`])];
   }
+  // 10 digits — search with and without 91 prefix
   return [...new Set([d, `91${d}`])];
 }
 
@@ -360,6 +380,27 @@ app.get('/api/parking/:id', async (req, res) => {
   } catch (e) { res.status(500).json({ success: false, error: e.message }); }
 });
 
+// ── Check vehicle active ─────────────────────────────────────
+// Fast check — only queries by vehicle number, no need to fetch all cars
+app.get('/api/parking/check-vehicle', async (req, res) => {
+  const vehicle = (req.query.vehicle || '').toUpperCase().trim();
+  if (!vehicle) return res.json({ active: false });
+  try {
+    const activeStatuses = ['parked', 'retrieve_requested', 'accepted'];
+    let isActive = false;
+    for (const status of activeStatuses) {
+      const snap = await col
+        .where('vehicle_number', '==', vehicle)
+        .where('status', '==', status)
+        .limit(1).get();
+      if (!snap.empty) { isActive = true; break; }
+    }
+    res.json({ active: isActive });
+  } catch (e) {
+    res.status(500).json({ active: false, error: e.message });
+  }
+});
+
 // ── Park a car ────────────────────────────────────────────────
 app.post('/api/parking/park', async (req, res) => {
   const { driver_name, guest_phone, vehicle_number, parking_area, parking_detail } = req.body;
@@ -454,17 +495,11 @@ app.post('/send-messages', async (req, res) => {
           ]);
         }
       } else if (templateName === 'retrieve') {
-        const queued = publish(QUEUES.RETRIEVE, {
-          phone,
-          driverName: bodyParams?.[0] || '',
-          slotMins:   bodyParams?.[1] || 5,
-        });
-        if (!queued) {
-          await sendTemplate(phone, 'retrieve', [
-            bodyParams?.[0] || '',
-            String(bodyParams?.[1] || 5),
-          ]);
-        }
+        // Time-sensitive — send directly, no queue
+        await sendTemplate(phone, 'retrieve', [
+          bodyParams?.[0] || '',
+          String(bodyParams?.[1] || 5),
+        ]);
       } else if (templateName === 'skip') {
         const queued = publish(QUEUES.SKIP, {
           phone,
@@ -526,6 +561,45 @@ app.post('/deliver-car', async (req, res) => {
     res.json({ success: true, carNumber });
   } catch (e) {
     console.error('❌ /deliver-car:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── Skip Car ─────────────────────────────────────────────────
+// Flutter calls when driver skips
+// Only sends MSG4 skip ONCE even if multiple drivers skip
+app.post('/skip-car', async (req, res) => {
+  const { docId } = req.body;
+  if (!docId) return res.status(400).json({ error: 'docId required' });
+  try {
+    const doc = await col.doc(docId).get();
+    if (!doc.exists) return res.status(404).json({ error: 'Car not found' });
+    const data = doc.data();
+
+    // If skip message already sent — do nothing (another driver already skipped)
+    if (data.skip_notified === true) {
+      console.log(`⏭️ Skip already notified | ${docId}`);
+      return res.json({ success: true, alreadyNotified: true });
+    }
+
+    // Mark skip_notified immediately to prevent race condition
+    await col.doc(docId).update({ skip_notified: true });
+
+    const phone    = data.guest_phone || '';
+    const area     = (data.parking_area || 'A').toUpperCase();
+    const slotMins = SLOT_MINUTES[area] ?? 5;
+    const totalWait = slotMins + slotMins;
+
+    if (phone) {
+      const nPhone = normalizePhone(phone);
+      // Send directly — no queue for speed
+      await sendTemplate(nPhone, 'skip', [String(totalWait)]);
+      console.log(`✅ MSG4 skip → ${nPhone} | wait:${totalWait}min`);
+    }
+
+    res.json({ success: true });
+  } catch (e) {
+    console.error('❌ /skip-car:', e.message);
     res.status(500).json({ error: e.message });
   }
 });
@@ -598,10 +672,12 @@ async function handleRetrieveCar(from) {
     const data    = matchedDoc.data();
     const carId   = matchedDoc.id;
 
-    // Firestore → retrieve_requested (no OTP saved)
+    // Firestore → retrieve_requested
+    // Reset skip_notified so guest can get skip message again if needed
     await matchedDoc.ref.update({
       status:                'retrieve_requested',
       Retrieve_request_time: admin.firestore.FieldValue.serverTimestamp(),
+      skip_notified:         false,
     });
     console.log(`✅ retrieve_requested | ${data.vehicle_number} | ${carId}`);
 
