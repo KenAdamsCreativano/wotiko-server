@@ -331,7 +331,7 @@ async function sendTemplate(to, name, params = []) {
         },
       }, { headers: WA_HEADERS() });
       if (!cached) localeCache.set(name, locale);
-      log('💬', 'WHATSAPP', `Template sent`, { template: name, to: to.slice(-4).padStart(to.length, '*') });
+      log('💬', 'WHATSAPP', `Template sent`, { template: name, to });
       return res.data;
     } catch (e) {
       if (e.response?.data?.error?.code === 132001) { lastErr = e; continue; }
@@ -449,7 +449,7 @@ app.post('/api/driver/login', async (req, res) => {
     }, { merge: true });
     log('👤', 'LOGIN', `Driver logged in`, {
       name: name || uid,
-      phone: phone ? phone.slice(-4).padStart(phone.length, '*') : 'N/A',
+      phone: phone || 'N/A',
     });
     res.json({ success: true });
   } catch (e) {
@@ -484,7 +484,7 @@ app.post('/api/parking/park', async (req, res) => {
       driver: driver_name,
       vehicle: vehicle_number,
       wing: parking_area,
-      guest: guest_phone.slice(-4).padStart(guest_phone.length, '*'),
+      guest: guest_phone,
       docId: ref.id,
     });
     res.status(201).json({ success: true, docId: ref.id });
@@ -780,7 +780,7 @@ async function handleRetrieveCar(from) {
       vehicle: data.vehicle_number,
       wing: (data.parking_area || '').toUpperCase(),
       driver: data.driver_name || 'unknown',
-      guest: maskPhone(data.guest_phone || ''),
+      guest: data.guest_phone || '',
       docId: carId,
     });
 
@@ -906,7 +906,7 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`\n🏨 Wotiko Valet Backend | Port ${PORT}`);
   console.log(`📲 MSG1:confirm_parked MSG2:retrieve MSG4:skip MSG5:cancel MSG6:end`);
   console.log(`🔗 Webhook: RetrieveCar→FCM+Firestore | CancelRetrieval→cancelled→parked(3s)`);
-  console.log(`🚫 OTP flow: REMOVED\n`);
+  
 });
 
 connectRabbitMQ();
