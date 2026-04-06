@@ -16,7 +16,6 @@
  *    → Flutter sends MSG2 retrieve  {{1}}=driverName {{2}}=slotMins
  *    → Button: Cancel Retrieval
  *    → Firestore: accepted
- *    → FCM retrieve_accepted → all other drivers dismiss notification
  *
  *  Driver SKIPS
  *    → Flutter sends MSG4 skip  {{1}}=totalWait (slotMins×2)
@@ -74,7 +73,7 @@ const WA_HEADERS  = () => ({
 });
 
 // ── Constants ─────────────────────────────────────────────────
-const VENUE_NAME   = 'Madras Square';
+const VENUE_NAME   = 'Madras Square';   // ← constant venue name
 const SLOT_MINUTES = { 'A': 2, 'B': 2, 'C': 3, 'D': 4, 'E': 5, 'OTHER': 6 };
 
 const PHRASES = [
@@ -115,7 +114,7 @@ async function connectRabbitMQ() {
       await mqChannel.assertQueue(q, { durable: true });
     }
     conn.on('error', e => { console.error('❌ RabbitMQ:', e.message); mqChannel = null; });
-    conn.on('close', () => {
+    conn.on('close', ()  => {
       console.warn('⚠️ RabbitMQ closed — retry 5s');
       mqChannel = null;
       setTimeout(connectRabbitMQ, 5000);
@@ -187,24 +186,28 @@ function startWorkers() {
     }, { noAck: false });
   };
 
+  // MSG1: confirm_parked — {{1}}=carNumber {{2}}=venueName {{3}}=driverName {{4}}=slotMins
   worker(QUEUES.PARKED,   j => sendTemplate(j.phone, 'confirm_parked',
     [j.carNumber, VENUE_NAME, j.driverName, String(j.slotMins)]));
 
+  // MSG2: retrieve — {{1}}=driverName {{2}}=slotMins
   worker(QUEUES.RETRIEVE, j => sendTemplate(j.phone, 'retrieve',
     [j.driverName, String(j.slotMins)]));
 
+  // MSG4: skip — {{1}}=totalWait
   worker(QUEUES.SKIP,     j => sendTemplate(j.phone, 'skip',
     [String(j.totalWait)]), 3, 15000);
 
+  // MSG5: cancel — no vars
   worker(QUEUES.CANCEL,   j => sendTemplate(j.phone, 'cancel',
     []), 3, 15000);
 
+  // MSG6: end — {{1}}=carNumber {{2}}=venueName {{3}}=phrase {{4}}=dish
   worker(QUEUES.END,      j => sendTemplate(j.phone, 'end',
     [j.carNumber, VENUE_NAME, j.phrase, j.dish]));
 
-  worker(QUEUES.FCM,      j => sendFCMNotification(
-    j.carNumber, j.carId, j.wing || '', j.guestMasked || 'Guest'
-  ), 2, 10000);
+  // FCM push
+  worker(QUEUES.FCM,      j => sendFCMNotification(j.carNumber, j.carId, j.wing || '', j.guestMasked || 'Guest'), 2, 10000);
 
   console.log('✅ All workers started');
 }
@@ -214,24 +217,30 @@ const app = express();
 app.use(helmet({ contentSecurityPolicy: false }));
 app.use(cors({
   origin: (origin, callback) => {
+    // Allow: mobile apps (no origin), server-to-server, and your domain
     const allowed = ['https://server.wotiko.com', 'http://localhost'];
     if (!origin || allowed.some(a => origin.startsWith(a))) {
       callback(null, true);
     } else {
-      callback(null, true);
+      callback(null, true); // Keep permissive for mobile app (no origin header)
     }
   },
   methods: ['GET','POST','PATCH','DELETE'],
 }));
 app.use(morgan('dev'));
-app.use(express.json({ type: '*/*', limit: '10kb' }));
-
-// ── Rate limiting ─────────────────────────────────────────────
+app.use(express.json({ type: '*/*', limit: '10kb' }));  // Prevent large payload attacks
+// ── Rate limiting ────────────────────────────────────────────
+// Only rate limit UNAUTHENTICATED requests (no valid API key)
+// Authenticated drivers (with API key) have no limit — supports unlimited cars
 app.use(rateLimit({
   windowMs: 15 * 60 * 1000,
-  max:      50,
+  max:      50,   // 50 requests per 15min for unauthenticated — blocks bots
   message:  { error: 'Too many requests' },
   skip: (req) => {
+    // Skip rate limit for:
+    // 1. Webhook (WhatsApp callbacks)
+    // 2. Health check
+    // 3. Any request with valid API key (authenticated drivers)
     if (req.path === '/webhook') return true;
     if (req.path === '/')        return true;
     const key = req.headers['x-api-key'];
@@ -259,7 +268,7 @@ app.use((req, res, next) => {
   next();
 });
 
-// ── Input sanitization ────────────────────────────────────────
+// ── Input sanitization ───────────────────────────────────────
 function sanitize(str) {
   if (typeof str !== 'string') return '';
   return str.trim().replace(/[<>"'&]/g, '').substring(0, 200);
@@ -268,10 +277,13 @@ function sanitize(str) {
 // ── Phone helpers ─────────────────────────────────────────────
 function normalizePhone(p) {
   const d = String(p).replace(/[^0-9]/g, '');
-  if (d.length === 10) return `91${d}`;
-  return d;
+  // If already has country code (more than 10 digits), use as is
+  // Otherwise assume India (+91) as this app is India-based
+  if (d.length === 10) return `91${d}`;  // legacy Indian 10-digit only
+  return d;                                 // already has country code
 }
 
+// ── Mask phone for guest privacy in FCM payload ───────────────
 function maskPhone(p) {
   const d = String(p).replace(/[^0-9]/g, '');
   if (d.length < 4) return 'Guest';
@@ -281,10 +293,12 @@ function maskPhone(p) {
 function buildPhoneVariants(p) {
   const d = String(p).replace(/[^0-9]/g, '');
   if (d.length > 10) {
+    // Has country code — search exact + last 10 digits + 91+last10
     const last10 = d.slice(-10);
-    const cc     = d.slice(0, d.length - 10);
+    const cc     = d.slice(0, d.length - 10); // country code digits
     return [...new Set([d, last10, `91${last10}`, `${cc}${last10}`])];
   }
+  // 10 digits — search with and without 91 prefix
   return [...new Set([d, `91${d}`])];
 }
 
@@ -399,6 +413,8 @@ app.get('/api/parking/:id', async (req, res) => {
   } catch (e) { res.status(500).json({ success: false, error: e.message }); }
 });
 
+// ── Check vehicle active ─────────────────────────────────────
+// Fast check — only queries by vehicle number, no need to fetch all cars
 app.get('/api/parking/check-vehicle', async (req, res) => {
   const vehicle = (req.query.vehicle || '').toUpperCase().trim();
   if (!vehicle) return res.json({ active: false });
@@ -418,19 +434,21 @@ app.get('/api/parking/check-vehicle', async (req, res) => {
   }
 });
 
+// ── Driver login log ─────────────────────────────────────────
+// Called from Flutter when driver logs in and saves FCM token
 app.post('/api/driver/login', async (req, res) => {
   const { uid, name, phone, fcmToken } = req.body;
   if (!uid) return res.status(400).json({ error: 'uid required' });
   try {
     await db.collection('drivers').doc(uid).set({
-      name:      name      || '',
-      phone:     phone     || '',
-      fcmToken:  fcmToken  || '',
+      name:      name  || '',
+      phone:     phone || '',
+      fcmToken:  fcmToken || '',
       lastLogin: admin.firestore.FieldValue.serverTimestamp(),
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     }, { merge: true });
     log('👤', 'LOGIN', `Driver logged in`, {
-      name:  name  || uid,
+      name: name || uid,
       phone: phone || 'N/A',
     });
     res.json({ success: true });
@@ -440,6 +458,7 @@ app.post('/api/driver/login', async (req, res) => {
   }
 });
 
+// ── Park a car ────────────────────────────────────────────────
 app.post('/api/parking/park', async (req, res) => {
   const { driver_name, guest_phone, vehicle_number, parking_area, parking_detail } = req.body;
   if (!driver_name || !guest_phone || !vehicle_number || !parking_area)
@@ -453,6 +472,7 @@ app.post('/api/parking/park', async (req, res) => {
       parking_area:          sanitize(parking_area).toUpperCase(),
       parking_detail:        sanitize(parking_detail || ''),
       status:                'parked',
+      // NO otp field — OTP flow removed
       Entry_time:            now,
       parked_time:           now,
       Retrieve_request_time: null,
@@ -461,17 +481,17 @@ app.post('/api/parking/park', async (req, res) => {
       Retrieve_time:         null,
     });
     log('🚗', 'PARK', `Car parked`, {
-      driver:  driver_name,
+      driver: driver_name,
       vehicle: vehicle_number,
-      wing:    parking_area,
-      guest:   guest_phone,
-      docId:   ref.id,
+      wing: parking_area,
+      guest: guest_phone,
+      docId: ref.id,
     });
     res.status(201).json({ success: true, docId: ref.id });
   } catch (e) { res.status(500).json({ success: false, error: e.message }); }
 });
 
-// ── ✅ FIXED: Update status ───────────────────────────────────
+// ── Update status ─────────────────────────────────────────────
 app.patch('/api/parking/:id/status', async (req, res) => {
   const { status } = req.body;
   const valid = ['parked','retrieve_requested','accepted','delivered','cancelled'];
@@ -481,34 +501,15 @@ app.patch('/api/parking/:id/status', async (req, res) => {
     const ref = col.doc(req.params.id);
     const doc = await ref.get();
     if (!doc.exists) return res.status(404).json({ success: false, error: 'Not found' });
-
     const update = { status };
-
     if (status === 'accepted') {
-      // ✅ Fixed: use req.params.id not undefined 'id'
+      const acceptDoc = await ref.get();
       log('👤', 'DRIVER', `Driver accepted retrieve request`, {
-        driver:  doc.data()?.driver_name    || 'unknown',
-        vehicle: doc.data()?.vehicle_number || req.params.id,
-        docId:   req.params.id,
+        driver: acceptDoc.data()?.driver_name || 'unknown',
+        vehicle: acceptDoc.data()?.vehicle_number || id,
+        docId: id,
       });
-
-      // ✅ NEW: Send FCM retrieve_accepted to ALL drivers
-      // so other drivers dismiss their notification immediately
-      const acceptSnap   = await db.collection('drivers').get();
-      const acceptTokens = acceptSnap.docs.map(d => d.data().fcmToken).filter(Boolean);
-      if (acceptTokens.length) {
-        await admin.messaging().sendEachForMulticast({
-          data:    { type: 'retrieve_accepted', carId: String(req.params.id) },
-          android: { priority: 'high', ttl: 30000 },
-          tokens:  acceptTokens,
-        }).catch(e => console.error('❌ Accept FCM:', e.message));
-        log('📲', 'FCM', `retrieve_accepted → all drivers`, {
-          count: acceptTokens.length,
-          docId: req.params.id,
-        });
-      }
     }
-
     if (status === 'delivered') {
       const now = admin.firestore.FieldValue.serverTimestamp();
       update.handover_time = now;
@@ -519,7 +520,6 @@ app.patch('/api/parking/:id/status', async (req, res) => {
         )} min`;
       }
     }
-
     await ref.update(update);
     res.json({ success: true });
   } catch (e) { res.status(500).json({ success: false, error: e.message }); }
@@ -534,6 +534,11 @@ app.delete('/api/parking/:id', async (req, res) => {
   } catch (e) { res.status(500).json({ success: false, error: e.message }); }
 });
 
+// ── Send messages (Flutter calls) ─────────────────────────────
+// MSG1 confirm_parked: Flutter sends [carNumber, driverName, slotMins]
+//   → Server adds VENUE_NAME as {{2}} automatically
+// MSG2 retrieve: Flutter sends after driver accepts
+// MSG4 skip: Flutter sends after driver skips
 app.post('/send-messages', async (req, res) => {
   const { phone, type, message, templateName, bodyParams } = req.body;
   if (!phone) return res.status(400).json({ error: 'phone required' });
@@ -544,6 +549,8 @@ app.post('/send-messages', async (req, res) => {
     }
     if (type === 'template') {
       if (templateName === 'confirm_parked') {
+        // Flutter sends [carNumber, driverName, slotMins]
+        // Server inserts VENUE_NAME as {{2}}
         const queued = publish(QUEUES.PARKED, {
           phone,
           carNumber:  bodyParams?.[0] || '',
@@ -559,6 +566,7 @@ app.post('/send-messages', async (req, res) => {
           ]);
         }
       } else if (templateName === 'retrieve') {
+        // Time-sensitive — send directly, no queue
         await sendTemplate(phone, 'retrieve', [
           bodyParams?.[0] || '',
           String(bodyParams?.[1] || 5),
@@ -584,6 +592,9 @@ app.post('/send-messages', async (req, res) => {
   }
 });
 
+// ── Deliver Car ───────────────────────────────────────────────
+// Flutter calls when driver taps Deliver Car
+// Sends MSG6 (end template) + updates Firestore → delivered
 app.post('/deliver-car', async (req, res) => {
   const { phone, docId } = req.body;
   if (!phone || !docId)
@@ -595,6 +606,8 @@ app.post('/deliver-car', async (req, res) => {
     const phrase    = pick(PHRASES);
     const dish      = pick(DISHES);
 
+    // Send MSG6: end template
+    // {{1}}=carNumber {{2}}=venueName {{3}}=phrase {{4}}=dish
     const queued = publish(QUEUES.END, {
       phone: normalizePhone(phone), carNumber, phrase, dish,
     });
@@ -603,12 +616,9 @@ app.post('/deliver-car', async (req, res) => {
         carNumber, VENUE_NAME, phrase, dish,
       ]);
     }
-    log('✅', 'DELIVER', `Car delivered`, {
-      vehicle: carNumber,
-      phrase:  phrase.substring(0, 20),
-      dish,
-    });
+    log('✅', 'DELIVER', `Car delivered`, { vehicle: carNumber, phrase: phrase.substring(0,20), dish });
 
+    // Update Firestore → delivered
     const now    = admin.firestore.FieldValue.serverTimestamp();
     const update = { status: 'delivered', handover_time: now, exited_time: now };
     if (doc.data().Retrieve_request_time) {
@@ -619,14 +629,14 @@ app.post('/deliver-car', async (req, res) => {
     await col.doc(docId).update(update);
     console.log(`✅ Delivered | ${docId}`);
 
-    // FCM delivered → all drivers dismiss notification
+    // Send FCM delivered to all drivers — cancels any active notification
     const deliverSnap   = await db.collection('drivers').get();
     const deliverTokens = deliverSnap.docs.map(d => d.data().fcmToken).filter(Boolean);
     if (deliverTokens.length) {
       await admin.messaging().sendEachForMulticast({
-        data:    { type: 'retrieve_delivered', carId: String(docId) },
-        android: { priority: 'high', ttl: 300000 }, // ✅ Fixed: 5min TTL
-        tokens:  deliverTokens,
+        data: { type: 'retrieve_delivered', carId: String(docId) },
+        android: { priority: 'high', ttl: 30000 },
+        tokens: deliverTokens,
       }).catch(e => console.error('❌ Delivered FCM:', e.message));
     }
 
@@ -637,6 +647,9 @@ app.post('/deliver-car', async (req, res) => {
   }
 });
 
+// ── Skip Car ─────────────────────────────────────────────────
+// Flutter calls when driver skips
+// Only sends MSG4 skip ONCE even if multiple drivers skip
 app.post('/skip-car', async (req, res) => {
   const { docId } = req.body;
   if (!docId) return res.status(400).json({ error: 'docId required' });
@@ -645,11 +658,13 @@ app.post('/skip-car', async (req, res) => {
     if (!doc.exists) return res.status(404).json({ error: 'Car not found' });
     const data = doc.data();
 
+    // If skip message already sent — do nothing (another driver already skipped)
     if (data.skip_notified === true) {
       console.log(`⏭️ Skip already notified | ${docId}`);
       return res.json({ success: true, alreadyNotified: true });
     }
 
+    // Mark skip_notified immediately to prevent race condition
     await col.doc(docId).update({ skip_notified: true });
 
     const phone    = data.guest_phone || '';
@@ -659,12 +674,9 @@ app.post('/skip-car', async (req, res) => {
 
     if (phone) {
       const nPhone = normalizePhone(phone);
+      // Send directly — no queue for speed
       await sendTemplate(nPhone, 'skip', [String(totalWait)]);
-      log('⏭️', 'SKIP', `Driver skipped — skip message sent`, {
-        vehicle:  data.vehicle_number,
-        wait:     `${totalWait}min`,
-        docId,
-      });
+      log('⏭️', 'SKIP', `Driver skipped — skip message sent`, { vehicle: data.vehicle_number, wait: `${totalWait}min`, docId });
     }
 
     res.json({ success: true });
@@ -685,6 +697,7 @@ app.get('/webhook', (req, res) => {
 
 // ── Webhook receive ───────────────────────────────────────────
 app.post('/webhook', express.raw({ type: 'application/json' }), (req, res) => {
+  // Verify X-Hub-Signature-256 from Meta — prevents fake webhooks
   const sig  = req.headers['x-hub-signature-256'] || '';
   const body = req.body;
   if (sig && process.env.WA_APP_SECRET) {
@@ -699,9 +712,7 @@ app.post('/webhook', express.raw({ type: 'application/json' }), (req, res) => {
     }
   }
   res.status(200).send('OK');
-  const parsed = typeof body === 'string'
-    ? JSON.parse(body)
-    : (Buffer.isBuffer(body) ? JSON.parse(body.toString()) : body);
+  const parsed = typeof body === 'string' ? JSON.parse(body) : (Buffer.isBuffer(body) ? JSON.parse(body.toString()) : body);
   setImmediate(() => processWebhook(parsed));
 });
 
@@ -729,11 +740,14 @@ async function processWebhook(body) {
   } catch (e) { console.error('💥 Webhook:', e.message); }
 }
 
+// ── Handle Retrieve Car button ────────────────────────────────
+// Guest taps Retrieve → FCM to all drivers, Firestore → retrieve_requested
 async function handleRetrieveCar(from) {
   console.log(`🚗 Retrieve: ${from}`);
   const variants = buildPhoneVariants(from);
   try {
     let matchedDoc = null;
+    // Search parked OR cancelled (guest may tap before 5s reset)
     for (const ph of variants) {
       for (const st of ['parked', 'cancelled']) {
         const snap = await col
@@ -752,9 +766,11 @@ async function handleRetrieveCar(from) {
       return;
     }
 
-    const data  = matchedDoc.data();
-    const carId = matchedDoc.id;
+    const data    = matchedDoc.data();
+    const carId   = matchedDoc.id;
 
+    // Firestore → retrieve_requested
+    // Reset skip_notified so guest can get skip message again if needed
     await matchedDoc.ref.update({
       status:                'retrieve_requested',
       Retrieve_request_time: admin.firestore.FieldValue.serverTimestamp(),
@@ -762,27 +778,29 @@ async function handleRetrieveCar(from) {
     });
     log('🔔', 'RETRIEVE', `Guest requesting car`, {
       vehicle: data.vehicle_number,
-      wing:    (data.parking_area || '').toUpperCase(),
-      driver:  data.driver_name  || 'unknown',
-      guest:   data.guest_phone  || '',
-      docId:   carId,
+      wing: (data.parking_area || '').toUpperCase(),
+      driver: data.driver_name || 'unknown',
+      guest: data.guest_phone || '',
+      docId: carId,
     });
 
+    // FCM push to all drivers (includes wing + masked guest phone)
     const wing        = (data.parking_area || '').toUpperCase();
     const guestMasked = maskPhone(data.guest_phone || '');
-    const fcmQueued   = publish(QUEUES.FCM, {
+    const fcmQueued = publish(QUEUES.FCM, {
       carNumber: data.vehicle_number,
       carId,
       wing,
       guestMasked,
     });
-    if (!fcmQueued) {
-      await sendFCMNotification(data.vehicle_number, carId, wing, guestMasked);
-    }
+    if (!fcmQueued) await sendFCMNotification(data.vehicle_number, carId, wing, guestMasked);
 
   } catch (e) { console.error('❌ handleRetrieveCar:', e.message); }
 }
 
+// ── Handle Cancel Retrieval button ───────────────────────────
+// Guest taps Cancel → MSG5 cancel → Firestore cancelled → immediately parked
+// Driver app detects cancelled → shows CancelRetrieveScreen
 async function handleCancelRetrieval(from) {
   console.log(`❌ Cancel: ${from}`);
   const nFrom    = normalizePhone(from);
@@ -807,29 +825,32 @@ async function handleCancelRetrieval(from) {
 
     const carId = matchedDoc.id;
 
+    // Step 1: set cancelled so Flutter detects → shows CancelRetrieveScreen
     await matchedDoc.ref.update({ status: 'cancelled' });
     log('❌', 'CANCEL', `Guest cancelled retrieval`, { docId: carId });
 
-    // FCM cancel → all drivers
-    const cancelSnap   = await db.collection('drivers').get();
-    const cancelTokens = cancelSnap.docs.map(d => d.data().fcmToken).filter(Boolean);
-    if (cancelTokens.length) {
+    // Send FCM cancel to all drivers — dismisses notification + closes alert activity
+    const cancelDriverSnap   = await db.collection('drivers').get();
+    const cancelDriverTokens = cancelDriverSnap.docs.map(d => d.data().fcmToken).filter(Boolean);
+    if (cancelDriverTokens.length) {
       await admin.messaging().sendEachForMulticast({
-        data:    { type: 'retrieve_cancelled', carId: String(carId) },
-        android: { priority: 'high', ttl: 300000 }, // ✅ Fixed: 5min TTL
-        tokens:  cancelTokens,
+        data: { type: 'retrieve_cancelled', carId: String(carId) },
+        android: { priority: 'high', ttl: 30000 },
+        tokens: cancelDriverTokens,
       }).catch(e => console.error('❌ Cancel FCM:', e.message));
-      console.log(`✅ Cancel FCM → ${cancelTokens.length} drivers`);
+      console.log(`✅ Cancel FCM → ${cancelDriverTokens.length} drivers`);
     }
 
-    // Reset to parked after 3s
+    // Step 2: immediately reset to parked (3s is enough for Flutter to detect)
+    // so guest can tap Retrieve again quickly
     setTimeout(async () => {
       try {
         await matchedDoc.ref.update({ status: 'parked' });
         log('🔄', 'STATUS', `Reset to parked after cancel`, { docId: carId });
       } catch (e) { console.error('❌ Reset parked:', e.message); }
-    }, 3000);
+    }, 3000); // 3 seconds — reduced from 5s for faster re-retrieve
 
+    // Step 3: Send MSG5 cancel to guest
     const queued = publish(QUEUES.CANCEL, { phone: nFrom });
     if (!queued) await sendTemplate(nFrom, 'cancel', []);
     console.log(`✅ MSG5 cancel → ${nFrom}`);
@@ -845,17 +866,19 @@ async function sendFCMNotification(carNumber, carId, wing = '', guestMasked = 'G
     if (!tokens.length) { console.log('⚠️ No FCM tokens'); return; }
 
     const res = await admin.messaging().sendEachForMulticast({
+      // data block — native WotikoFirebaseMessagingService reads all fields
+      // and shows full screen notification with vehicle, wing, and guest info
       data: {
-        type:        'retrieve_requested',
-        carNumber:   String(carNumber),
-        carId:       String(carId),
-        wing:        String(wing        || ''),
-        guestMasked: String(guestMasked || 'Guest'),
-        requestId:   String(carId),
+        type:         'retrieve_requested',
+        carNumber:    String(carNumber),
+        carId:        String(carId),
+        wing:         String(wing     || ''),
+        guestMasked:  String(guestMasked || 'Guest'),
+        requestId:    String(carId),
       },
       android: {
-        priority: 'high',
-        ttl:      300000, // ✅ Fixed: 5min TTL
+        priority: 'high',  // MUST be high — wakes device even when killed
+        ttl:      60000,
       },
       apns: {
         headers: { 'apns-priority': '10', 'apns-push-type': 'background' },
@@ -883,6 +906,7 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`\n🏨 Wotiko Valet Backend | Port ${PORT}`);
   console.log(`📲 MSG1:confirm_parked MSG2:retrieve MSG4:skip MSG5:cancel MSG6:end`);
   console.log(`🔗 Webhook: RetrieveCar→FCM+Firestore | CancelRetrieval→cancelled→parked(3s)`);
+  console.log(`🚫 OTP flow: REMOVED\n`);
 });
 
 connectRabbitMQ();
