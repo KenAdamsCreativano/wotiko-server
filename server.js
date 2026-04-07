@@ -892,9 +892,29 @@ async function sendFCMNotification(carNumber, carId, wing = '', guestMasked = 'G
       vehicle: carNumber,
       wing,
     });
+
+    // Auto-delete invalid tokens so they stop clogging future sends
+    const invalidTokens = [];
     res.responses.forEach((r, i) => {
-      if (!r.success) log('❌', 'FCM', `Token failed`, { index: i, error: r.error?.code });
+      if (!r.success) {
+        log('❌', 'FCM', `Token failed`, { index: i, error: r.error?.code });
+        if (r.error?.code === 'messaging/registration-token-not-registered' ||
+            r.error?.code === 'messaging/invalid-registration-token') {
+          invalidTokens.push(tokens[i]);
+        }
+      }
     });
+    if (invalidTokens.length > 0) {
+      const allDrivers = await db.collection('drivers').get();
+      const batch = db.batch();
+      allDrivers.docs.forEach(doc => {
+        if (invalidTokens.includes(doc.data().fcmToken)) {
+          batch.update(doc.ref, { fcmToken: '' });
+          log('🧹', 'FCM', 'Removed invalid token', { driver: doc.data().name || doc.id });
+        }
+      });
+      await batch.commit();
+    }
   } catch (e) { console.error('❌ FCM:', e.message); }
 }
 
