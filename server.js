@@ -926,7 +926,7 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`\n🏨 Wotiko Valet Backend | Port ${PORT}`);
   console.log(`📲 MSG1:confirm_parked MSG2:retrieve MSG4:skip MSG5:cancel MSG6:end`);
   console.log(`🔗 Webhook: RetrieveCar→FCM+Firestore | CancelRetrieval→cancelled→parked(3s)`);
-  console.log(`🚫 OTP flow: REMOVED\n`);
+ 
 });
 
 connectRabbitMQ();
