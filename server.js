@@ -865,9 +865,15 @@ async function sendFCMNotification(carNumber, carId, wing = '', guestMasked = 'G
     const tokens = snap.docs.map(d => d.data().fcmToken).filter(Boolean);
     if (!tokens.length) { console.log('⚠️ No FCM tokens'); return; }
 
+    const meta = wing ? `Wing ${wing}  •  Guest waiting` : 'Guest waiting';
+
     const res = await admin.messaging().sendEachForMulticast({
-      // data block — native WotikoFirebaseMessagingService reads all fields
-      // and shows full screen notification with vehicle, wing, and guest info
+      // notification block — Android shows this automatically with sound
+      notification: {
+        title: `Car Retrieve  •  ${carNumber}`,
+        body:  meta,
+      },
+      // data block — Kotlin service reads these fields
       data: {
         type:         'retrieve_requested',
         carNumber:    String(carNumber),
@@ -877,8 +883,17 @@ async function sendFCMNotification(carNumber, carId, wing = '', guestMasked = 'G
         requestId:    String(carId),
       },
       android: {
-        priority: 'high',  // MUST be high — wakes device even when killed
+        priority: 'high',
         ttl:      60000,
+        notification: {
+          sound:        'retrival_ringtone_wotiko',  // res/raw file name
+          channelId:    'wotiko_v9',
+          priority:     'max',
+          defaultSound: false,
+          defaultVibrateTimings: false,
+          vibrateTimingsMillis: [0, 800, 400, 800, 400, 800],
+          visibility:   'public',
+        },
       },
       apns: {
         headers: { 'apns-priority': '10', 'apns-push-type': 'background' },
@@ -926,7 +941,7 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`\n🏨 Wotiko Valet Backend | Port ${PORT}`);
   console.log(`📲 MSG1:confirm_parked MSG2:retrieve MSG4:skip MSG5:cancel MSG6:end`);
   console.log(`🔗 Webhook: RetrieveCar→FCM+Firestore | CancelRetrieval→cancelled→parked(3s)`);
- 
+  console.log(`🚫 OTP flow: REMOVED\n`);
 });
 
 connectRabbitMQ();
