@@ -73,7 +73,7 @@ const WA_HEADERS  = () => ({
 });
 
 // ── Constants ─────────────────────────────────────────────────
-const VENUE_NAME   = 'Madras Square';   // ← constant venue name
+const VENUE_NAME   = 'Madras Square';
 const SLOT_MINUTES = { 'A': 2, 'B': 2, 'C': 3, 'D': 4, 'E': 5, 'OTHER': 6 };
 
 const PHRASES = [
@@ -207,7 +207,7 @@ function startWorkers() {
     [j.carNumber, VENUE_NAME, j.phrase, j.dish]));
 
   // FCM push
-  worker(QUEUES.FCM,      j => sendFCMNotification(j.carNumber, j.carId, j.wing || '', j.guestMasked || 'Guest'), 2, 10000);
+  worker(QUEUES.FCM, j => sendFCMNotification(j.carNumber, j.carId, j.wing || '', j.guestMasked || 'Guest'), 2, 10000);
 
   console.log('✅ All workers started');
 }
@@ -217,30 +217,24 @@ const app = express();
 app.use(helmet({ contentSecurityPolicy: false }));
 app.use(cors({
   origin: (origin, callback) => {
-    // Allow: mobile apps (no origin), server-to-server, and your domain
     const allowed = ['https://server.wotiko.com', 'http://localhost'];
     if (!origin || allowed.some(a => origin.startsWith(a))) {
       callback(null, true);
     } else {
-      callback(null, true); // Keep permissive for mobile app (no origin header)
+      callback(null, true);
     }
   },
   methods: ['GET','POST','PATCH','DELETE'],
 }));
 app.use(morgan('dev'));
-app.use(express.json({ type: '*/*', limit: '10kb' }));  // Prevent large payload attacks
+app.use(express.json({ type: '*/*', limit: '10kb' }));
+
 // ── Rate limiting ────────────────────────────────────────────
-// Only rate limit UNAUTHENTICATED requests (no valid API key)
-// Authenticated drivers (with API key) have no limit — supports unlimited cars
 app.use(rateLimit({
   windowMs: 15 * 60 * 1000,
-  max:      50,   // 50 requests per 15min for unauthenticated — blocks bots
+  max:      50,
   message:  { error: 'Too many requests' },
   skip: (req) => {
-    // Skip rate limit for:
-    // 1. Webhook (WhatsApp callbacks)
-    // 2. Health check
-    // 3. Any request with valid API key (authenticated drivers)
     if (req.path === '/webhook') return true;
     if (req.path === '/')        return true;
     const key = req.headers['x-api-key'];
@@ -277,13 +271,10 @@ function sanitize(str) {
 // ── Phone helpers ─────────────────────────────────────────────
 function normalizePhone(p) {
   const d = String(p).replace(/[^0-9]/g, '');
-  // If already has country code (more than 10 digits), use as is
-  // Otherwise assume India (+91) as this app is India-based
-  if (d.length === 10) return `91${d}`;  // legacy Indian 10-digit only
-  return d;                                 // already has country code
+  if (d.length === 10) return `91${d}`;
+  return d;
 }
 
-// ── Mask phone for guest privacy in FCM payload ───────────────
 function maskPhone(p) {
   const d = String(p).replace(/[^0-9]/g, '');
   if (d.length < 4) return 'Guest';
@@ -293,12 +284,10 @@ function maskPhone(p) {
 function buildPhoneVariants(p) {
   const d = String(p).replace(/[^0-9]/g, '');
   if (d.length > 10) {
-    // Has country code — search exact + last 10 digits + 91+last10
     const last10 = d.slice(-10);
-    const cc     = d.slice(0, d.length - 10); // country code digits
+    const cc     = d.slice(0, d.length - 10);
     return [...new Set([d, last10, `91${last10}`, `${cc}${last10}`])];
   }
-  // 10 digits — search with and without 91 prefix
   return [...new Set([d, `91${d}`])];
 }
 
@@ -414,7 +403,6 @@ app.get('/api/parking/:id', async (req, res) => {
 });
 
 // ── Check vehicle active ─────────────────────────────────────
-// Fast check — only queries by vehicle number, no need to fetch all cars
 app.get('/api/parking/check-vehicle', async (req, res) => {
   const vehicle = (req.query.vehicle || '').toUpperCase().trim();
   if (!vehicle) return res.json({ active: false });
@@ -435,7 +423,6 @@ app.get('/api/parking/check-vehicle', async (req, res) => {
 });
 
 // ── Driver login log ─────────────────────────────────────────
-// Called from Flutter when driver logs in and saves FCM token
 app.post('/api/driver/login', async (req, res) => {
   const { uid, name, phone, fcmToken } = req.body;
   if (!uid) return res.status(400).json({ error: 'uid required' });
@@ -472,7 +459,6 @@ app.post('/api/parking/park', async (req, res) => {
       parking_area:          sanitize(parking_area).toUpperCase(),
       parking_detail:        sanitize(parking_detail || ''),
       status:                'parked',
-      // NO otp field — OTP flow removed
       Entry_time:            now,
       parked_time:           now,
       Retrieve_request_time: null,
@@ -493,23 +479,29 @@ app.post('/api/parking/park', async (req, res) => {
 
 // ── Update status ─────────────────────────────────────────────
 app.patch('/api/parking/:id/status', async (req, res) => {
+  // FIX 5: Declare `id` at the top of the handler — was referenced later
+  // in the 'accepted' branch via bare `id` variable which did not exist,
+  // causing a ReferenceError crash on every driver accept.
+  const id     = req.params.id;
   const { status } = req.body;
   const valid = ['parked','retrieve_requested','accepted','delivered','cancelled'];
   if (!valid.includes(status))
     return res.status(400).json({ success: false, error: 'Invalid status' });
   try {
-    const ref = col.doc(req.params.id);
+    const ref = col.doc(id);
     const doc = await ref.get();
     if (!doc.exists) return res.status(404).json({ success: false, error: 'Not found' });
+
     const update = { status };
+
     if (status === 'accepted') {
-      const acceptDoc = await ref.get();
       log('👤', 'DRIVER', `Driver accepted retrieve request`, {
-        driver: acceptDoc.data()?.driver_name || 'unknown',
-        vehicle: acceptDoc.data()?.vehicle_number || id,
-        docId: id,
+        driver:  doc.data()?.driver_name    || 'unknown',
+        vehicle: doc.data()?.vehicle_number || id,
+        docId:   id,
       });
     }
+
     if (status === 'delivered') {
       const now = admin.firestore.FieldValue.serverTimestamp();
       update.handover_time = now;
@@ -520,6 +512,7 @@ app.patch('/api/parking/:id/status', async (req, res) => {
         )} min`;
       }
     }
+
     await ref.update(update);
     res.json({ success: true });
   } catch (e) { res.status(500).json({ success: false, error: e.message }); }
@@ -535,10 +528,6 @@ app.delete('/api/parking/:id', async (req, res) => {
 });
 
 // ── Send messages (Flutter calls) ─────────────────────────────
-// MSG1 confirm_parked: Flutter sends [carNumber, driverName, slotMins]
-//   → Server adds VENUE_NAME as {{2}} automatically
-// MSG2 retrieve: Flutter sends after driver accepts
-// MSG4 skip: Flutter sends after driver skips
 app.post('/send-messages', async (req, res) => {
   const { phone, type, message, templateName, bodyParams } = req.body;
   if (!phone) return res.status(400).json({ error: 'phone required' });
@@ -549,8 +538,6 @@ app.post('/send-messages', async (req, res) => {
     }
     if (type === 'template') {
       if (templateName === 'confirm_parked') {
-        // Flutter sends [carNumber, driverName, slotMins]
-        // Server inserts VENUE_NAME as {{2}}
         const queued = publish(QUEUES.PARKED, {
           phone,
           carNumber:  bodyParams?.[0] || '',
@@ -566,7 +553,6 @@ app.post('/send-messages', async (req, res) => {
           ]);
         }
       } else if (templateName === 'retrieve') {
-        // Time-sensitive — send directly, no queue
         await sendTemplate(phone, 'retrieve', [
           bodyParams?.[0] || '',
           String(bodyParams?.[1] || 5),
@@ -593,8 +579,6 @@ app.post('/send-messages', async (req, res) => {
 });
 
 // ── Deliver Car ───────────────────────────────────────────────
-// Flutter calls when driver taps Deliver Car
-// Sends MSG6 (end template) + updates Firestore → delivered
 app.post('/deliver-car', async (req, res) => {
   const { phone, docId } = req.body;
   if (!phone || !docId)
@@ -606,8 +590,6 @@ app.post('/deliver-car', async (req, res) => {
     const phrase    = pick(PHRASES);
     const dish      = pick(DISHES);
 
-    // Send MSG6: end template
-    // {{1}}=carNumber {{2}}=venueName {{3}}=phrase {{4}}=dish
     const queued = publish(QUEUES.END, {
       phone: normalizePhone(phone), carNumber, phrase, dish,
     });
@@ -618,7 +600,6 @@ app.post('/deliver-car', async (req, res) => {
     }
     log('✅', 'DELIVER', `Car delivered`, { vehicle: carNumber, phrase: phrase.substring(0,20), dish });
 
-    // Update Firestore → delivered
     const now    = admin.firestore.FieldValue.serverTimestamp();
     const update = { status: 'delivered', handover_time: now, exited_time: now };
     if (doc.data().Retrieve_request_time) {
@@ -629,7 +610,6 @@ app.post('/deliver-car', async (req, res) => {
     await col.doc(docId).update(update);
     console.log(`✅ Delivered | ${docId}`);
 
-    // Send FCM delivered to all drivers — cancels any active notification
     const deliverSnap   = await db.collection('drivers').get();
     const deliverTokens = deliverSnap.docs.map(d => d.data().fcmToken).filter(Boolean);
     if (deliverTokens.length) {
@@ -648,8 +628,6 @@ app.post('/deliver-car', async (req, res) => {
 });
 
 // ── Skip Car ─────────────────────────────────────────────────
-// Flutter calls when driver skips
-// Only sends MSG4 skip ONCE even if multiple drivers skip
 app.post('/skip-car', async (req, res) => {
   const { docId } = req.body;
   if (!docId) return res.status(400).json({ error: 'docId required' });
@@ -658,13 +636,11 @@ app.post('/skip-car', async (req, res) => {
     if (!doc.exists) return res.status(404).json({ error: 'Car not found' });
     const data = doc.data();
 
-    // If skip message already sent — do nothing (another driver already skipped)
     if (data.skip_notified === true) {
       console.log(`⏭️ Skip already notified | ${docId}`);
       return res.json({ success: true, alreadyNotified: true });
     }
 
-    // Mark skip_notified immediately to prevent race condition
     await col.doc(docId).update({ skip_notified: true });
 
     const phone    = data.guest_phone || '';
@@ -674,7 +650,6 @@ app.post('/skip-car', async (req, res) => {
 
     if (phone) {
       const nPhone = normalizePhone(phone);
-      // Send directly — no queue for speed
       await sendTemplate(nPhone, 'skip', [String(totalWait)]);
       log('⏭️', 'SKIP', `Driver skipped — skip message sent`, { vehicle: data.vehicle_number, wait: `${totalWait}min`, docId });
     }
@@ -697,7 +672,6 @@ app.get('/webhook', (req, res) => {
 
 // ── Webhook receive ───────────────────────────────────────────
 app.post('/webhook', express.raw({ type: 'application/json' }), (req, res) => {
-  // Verify X-Hub-Signature-256 from Meta — prevents fake webhooks
   const sig  = req.headers['x-hub-signature-256'] || '';
   const body = req.body;
   if (sig && process.env.WA_APP_SECRET) {
@@ -741,13 +715,11 @@ async function processWebhook(body) {
 }
 
 // ── Handle Retrieve Car button ────────────────────────────────
-// Guest taps Retrieve → FCM to all drivers, Firestore → retrieve_requested
 async function handleRetrieveCar(from) {
   console.log(`🚗 Retrieve: ${from}`);
   const variants = buildPhoneVariants(from);
   try {
     let matchedDoc = null;
-    // Search parked OR cancelled (guest may tap before 5s reset)
     for (const ph of variants) {
       for (const st of ['parked', 'cancelled']) {
         const snap = await col
@@ -766,11 +738,9 @@ async function handleRetrieveCar(from) {
       return;
     }
 
-    const data    = matchedDoc.data();
-    const carId   = matchedDoc.id;
+    const data  = matchedDoc.data();
+    const carId = matchedDoc.id;
 
-    // Firestore → retrieve_requested
-    // Reset skip_notified so guest can get skip message again if needed
     await matchedDoc.ref.update({
       status:                'retrieve_requested',
       Retrieve_request_time: admin.firestore.FieldValue.serverTimestamp(),
@@ -784,7 +754,6 @@ async function handleRetrieveCar(from) {
       docId: carId,
     });
 
-    // FCM push to all drivers (includes wing + masked guest phone)
     const wing        = (data.parking_area || '').toUpperCase();
     const guestMasked = maskPhone(data.guest_phone || '');
     const fcmQueued = publish(QUEUES.FCM, {
@@ -799,8 +768,6 @@ async function handleRetrieveCar(from) {
 }
 
 // ── Handle Cancel Retrieval button ───────────────────────────
-// Guest taps Cancel → MSG5 cancel → Firestore cancelled → immediately parked
-// Driver app detects cancelled → shows CancelRetrieveScreen
 async function handleCancelRetrieval(from) {
   console.log(`❌ Cancel: ${from}`);
   const nFrom    = normalizePhone(from);
@@ -825,11 +792,9 @@ async function handleCancelRetrieval(from) {
 
     const carId = matchedDoc.id;
 
-    // Step 1: set cancelled so Flutter detects → shows CancelRetrieveScreen
     await matchedDoc.ref.update({ status: 'cancelled' });
     log('❌', 'CANCEL', `Guest cancelled retrieval`, { docId: carId });
 
-    // Send FCM cancel to all drivers — dismisses notification + closes alert activity
     const cancelDriverSnap   = await db.collection('drivers').get();
     const cancelDriverTokens = cancelDriverSnap.docs.map(d => d.data().fcmToken).filter(Boolean);
     if (cancelDriverTokens.length) {
@@ -841,16 +806,13 @@ async function handleCancelRetrieval(from) {
       console.log(`✅ Cancel FCM → ${cancelDriverTokens.length} drivers`);
     }
 
-    // Step 2: immediately reset to parked (3s is enough for Flutter to detect)
-    // so guest can tap Retrieve again quickly
     setTimeout(async () => {
       try {
         await matchedDoc.ref.update({ status: 'parked' });
         log('🔄', 'STATUS', `Reset to parked after cancel`, { docId: carId });
       } catch (e) { console.error('❌ Reset parked:', e.message); }
-    }, 3000); // 3 seconds — reduced from 5s for faster re-retrieve
+    }, 3000);
 
-    // Step 3: Send MSG5 cancel to guest
     const queued = publish(QUEUES.CANCEL, { phone: nFrom });
     if (!queued) await sendTemplate(nFrom, 'cancel', []);
     console.log(`✅ MSG5 cancel → ${nFrom}`);
@@ -865,35 +827,17 @@ async function sendFCMNotification(carNumber, carId, wing = '', guestMasked = 'G
     const tokens = snap.docs.map(d => d.data().fcmToken).filter(Boolean);
     if (!tokens.length) { console.log('⚠️ No FCM tokens'); return; }
 
-    const meta = wing ? `Wing ${wing}  •  Guest waiting` : 'Guest waiting';
-
     const res = await admin.messaging().sendEachForMulticast({
-      // notification block — Android shows this automatically with sound
-      notification: {
-        title: `Car Retrieve  •  ${carNumber}`,
-        body:  meta,
-      },
-      // data block — Kotlin service reads these fields
       data: {
-        type:         'retrieve_requested',
-        carNumber:    String(carNumber),
-        carId:        String(carId),
-        wing:         String(wing     || ''),
-        guestMasked:  String(guestMasked || 'Guest'),
-        requestId:    String(carId),
+        type:        'retrieve_requested',
+        carNumber:   String(carNumber),
+        carId:       String(carId),
+        wing:        String(wing        || ''),
+        guestMasked: String(guestMasked || 'Guest'),
       },
       android: {
         priority: 'high',
         ttl:      60000,
-        notification: {
-          sound:        'retrival_ringtone_wotiko',  // res/raw file name
-          channelId:    'wotiko_v9',
-          priority:     'max',
-          defaultSound: false,
-          defaultVibrateTimings: false,
-          vibrateTimingsMillis: [0, 800, 400, 800, 400, 800],
-          visibility:   'public',
-        },
       },
       apns: {
         headers: { 'apns-priority': '10', 'apns-push-type': 'background' },
@@ -902,19 +846,20 @@ async function sendFCMNotification(carNumber, carId, wing = '', guestMasked = 'G
       tokens,
     });
 
-    log('📲', 'FCM', `Push sent to drivers`, {
+    log('📲', 'FCM', `Push sent`, {
       success: `${res.successCount}/${tokens.length}`,
       vehicle: carNumber,
       wing,
     });
 
-    // Auto-delete invalid tokens so they stop clogging future sends
     const invalidTokens = [];
     res.responses.forEach((r, i) => {
       if (!r.success) {
         log('❌', 'FCM', `Token failed`, { index: i, error: r.error?.code });
-        if (r.error?.code === 'messaging/registration-token-not-registered' ||
-            r.error?.code === 'messaging/invalid-registration-token') {
+        if (
+          r.error?.code === 'messaging/registration-token-not-registered' ||
+          r.error?.code === 'messaging/invalid-registration-token'
+        ) {
           invalidTokens.push(tokens[i]);
         }
       }
@@ -929,6 +874,7 @@ async function sendFCMNotification(carNumber, carId, wing = '', guestMasked = 'G
         }
       });
       await batch.commit();
+      log('🧹', 'FCM', `Removed ${invalidTokens.length} invalid tokens`);
     }
   } catch (e) { console.error('❌ FCM:', e.message); }
 }
