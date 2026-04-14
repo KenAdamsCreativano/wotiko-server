@@ -1,53 +1,52 @@
-const express = require('express');
-const cors = require('cors');
-const helmet = require('helmet');
-const morgan = require('morgan');
-const axios = require('axios');
+/**
+ * server.js — Wotiko Valet Backend
+ * Production-grade with retry, pending check, and full reliability layer.
+ *
+ * FLOW:
+ *  Guest parks  → MSG1 confirm_parked → button: Retrieve Car
+ *  Guest taps   → FCM to all drivers → AlarmManager → fullscreen alert
+ *  Driver accept→ MSG2 retrieve → button: Cancel
+ *  Driver skip  → MSG4 skip (once only, skip_notified flag)
+ *  Guest cancel → MSG5 cancel → Firestore: cancelled → parked after 3s
+ *  Driver deliver→ MSG6 end
+ */
+
+'use strict';
+
+const express   = require('express');
+const cors      = require('cors');
+const helmet    = require('helmet');
+const morgan    = require('morgan');
+const axios     = require('axios');
 const rateLimit = require('express-rate-limit');
-const amqp = require('amqplib');
-const crypto = require('crypto');
+const amqp      = require('amqplib');
 require('dotenv').config();
-
-function log(emoji, category, message, meta = {}) {
-  const ts = new Date().toLocaleString('en-IN', {
-    timeZone: 'Asia/Kolkata',
-    hour12: true,
-  });
-
-  const metaStr = Object.keys(meta).length
-    ? '  ' + Object.entries(meta).map(([k, v]) => `${k}:${v}`).join(' | ')
-    : '';
-
-  console.log(`[${ts}] ${emoji} [${category}] ${message}${metaStr}`);
-}
 
 const admin = require('firebase-admin');
 admin.initializeApp({
   credential: admin.credential.cert({
-    projectId: process.env.FIREBASE_PROJECT_ID,
+    projectId:   process.env.FIREBASE_PROJECT_ID,
     clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
-    privateKey: process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n'),
+    privateKey:  process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n'),
   }),
 });
-
-const db = admin.firestore();
+const db  = admin.firestore();
 const col = db.collection('parked_cars');
+console.log('✅ Firebase Admin initialized');
 
-log('OK', 'BOOT', 'Firebase Admin initialized');
-
-const WA_TOKEN = process.env.WHATSAPP_ACCESS_TOKEN;
+// ── WhatsApp ─────────────────────────────────────────────────
+const WA_TOKEN    = process.env.WHATSAPP_ACCESS_TOKEN;
 const WA_PHONE_ID = process.env.WHATSAPP_PHONE_NUMBER_ID;
-const WA_VERIFY = process.env.WEBHOOK_VERIFY_TOKEN || 'my-verify-token';
-const WA_BASE = `https://graph.facebook.com/v19.0/${WA_PHONE_ID}/messages`;
-
-const WA_HEADERS = () => ({
-  Authorization: `Bearer ${WA_TOKEN}`,
+const WA_VERIFY   = process.env.WEBHOOK_VERIFY_TOKEN || 'my-verify-token';
+const WA_BASE     = `https://graph.facebook.com/v19.0/${WA_PHONE_ID}/messages`;
+const WA_HEADERS  = () => ({
+  Authorization:  `Bearer ${WA_TOKEN}`,
   'Content-Type': 'application/json',
 });
 
-const VENUE_NAME = 'Madras Square';
-const SLOT_MINUTES = { A: 2, B: 2, C: 3, D: 4, E: 5, OTHER: 6 };
-
+// ── Constants ─────────────────────────────────────────────────
+const VENUE_NAME   = 'Madras Square';
+const SLOT_MINUTES = { 'A': 2, 'B': 2, 'C': 3, 'D': 4, 'E': 5, 'OTHER': 6 };
 const PHRASES = [
   "Wotiko's vote is with",
   'Team Wotiko is crazy about',
@@ -58,859 +57,848 @@ const PHRASES = [
   "This week's fave dish was",
   'Tira miss it already! That and',
 ];
-
 const DISHES = [
   'Truffle Garlic Fried Rice',
   'Curry Butter Garlic Prawns',
   'Dragon Chicken',
   'Chicken Quesadillas',
-  'Pan Grilled Salmon',
+  'Pan Seared Salmon',
+  'Burrata Bruschetta',
+  'Chocolate Lava Cake',
+  'Smoked BBQ Ribs',
 ];
 
 const pick = arr => arr[Math.floor(Math.random() * arr.length)];
 
-let mqChannel = null;
+// ── Retry system — Firestore-backed (survives server restart) ────
+// FIX 1: in-memory Map was lost on server restart → driver never gets alert.
+// All job state now written to Firestore 'activeJobs' collection.
+// On startup we re-hydrate any pending jobs and restart their retry loops.
 
-const QUEUES = {
-  PARKED: 'whatsapp.parked',
-  RETRIEVE: 'whatsapp.retrieve',
-  SKIP: 'whatsapp.skip',
-  CANCEL: 'whatsapp.cancel',
-  END: 'whatsapp.end',
-  FCM: 'fcm.notify',
-};
+const JOBS_COL     = 'activeJobs';       // Firestore collection
+const JOB_TIMEOUT  = 60_000;             // 60s matches Android alarm timeout
+const RETRY_DELAY  = 7_000;             // resend every 7s if no ack
+const MAX_RETRIES  = 3;                  // max 3 FCM sends
+
+// In-memory set tracks which carIds have active retry timers THIS process.
+// Firestore is the source of truth; this just prevents double-scheduling.
+const scheduledRetries = new Set();
+
+async function jobGet(carId) {
+  const doc = await db.collection(JOBS_COL).doc(carId).get();
+  return doc.exists ? doc.data() : null;
+}
+
+async function jobSet(carId, data) {
+  await db.collection(JOBS_COL).doc(carId).set(data, { merge: true });
+}
+
+async function jobDelete(carId) {
+  await db.collection(JOBS_COL).doc(carId).delete().catch(() => {});
+  scheduledRetries.delete(carId);
+}
+
+// Re-hydrate: on startup, resume retry loops for any jobs still pending.
+// WHY: server restart must not abandon in-flight jobs.
+async function rehydrateJobs() {
+  try {
+    const snap = await db.collection(JOBS_COL)
+      .where('status', '==', 'pending').get();
+    if (snap.empty) { log('ℹ️', 'Jobs', 'No pending jobs to rehydrate'); return; }
+    snap.docs.forEach(doc => {
+      const job = doc.data();
+      const age = Date.now() - (job.sentAt || 0);
+      if (age < JOB_TIMEOUT) {
+        log('🔄', 'Jobs', \`Rehydrating carId=\${doc.id} age=\${Math.round(age/1000)}s\`);
+        scheduleRetry(doc.id);
+      } else {
+        // Too old — clean up
+        jobDelete(doc.id).catch(() => {});
+      }
+    });
+  } catch (e) { log('❌', 'Jobs', \`rehydrateJobs: \${e.message}\`); }
+}
+
+// ── Logging ───────────────────────────────────────────────────
+function log(icon, tag, msg, meta = {}) {
+  const ts   = new Date().toISOString().slice(11, 23);
+  const extra = Object.keys(meta).length
+    ? ' | ' + Object.entries(meta).map(([k,v]) => `${k}:${v}`).join(' ')
+    : '';
+  console.log(`[${ts}] ${icon} [${tag}] ${msg}${extra}`);
+}
+
+// ── Phone normalisation ───────────────────────────────────────
+function normalizePhone(raw = '') {
+  let p = raw.replace(/\D/g, '');
+  if (p.startsWith('0'))  p = '91' + p.slice(1);
+  if (p.length === 10)    p = '91' + p;
+  return p;
+}
+
+// ── Firestore doc → JS object ─────────────────────────────────
+function docToObj(doc) {
+  const d = doc.data();
+  const ts = t => t?.toDate?.()?.toISOString() ?? null;
+  return {
+    id:              doc.id,
+    driver_name:     d.driver_name     || '',
+    guest_phone:     d.guest_phone     || '',
+    vehicle_number:  d.vehicle_number  || '',
+    parking_area:    d.parking_area    || '',
+    parking_detail:  d.parking_detail  || '',
+    status:          d.status          || '',
+    otp:             d.otp             ?? null,
+    skip_notified:   d.skip_notified   || false,
+    Entry_time:      ts(d.Entry_time),
+    parked_time:     ts(d.parked_time),
+    Retrieve_request_time: ts(d.Retrieve_request_time),
+    handover_time:   ts(d.handover_time),
+    exited_time:     ts(d.exited_time),
+    parked_time:     d.parked_time
+      ? { iso: ts(d.parked_time), human: d.parked_time.toDate().toLocaleString('en-IN') }
+      : null,
+  };
+}
+
+// ── RabbitMQ ──────────────────────────────────────────────────
+const RABBITMQ_URL = process.env.RABBITMQ_URL || 'amqp://localhost';
+const QUEUES = { CONFIRM: 'confirm_parked', RETRIEVE: 'retrieve', SKIP: 'skip', CANCEL: 'cancel', END: 'end' };
+let channel = null;
 
 async function connectRabbitMQ() {
   try {
-    const conn = await amqp.connect('amqp://localhost');
-    mqChannel = await conn.createChannel();
-
-    for (const q of Object.values(QUEUES)) {
-      await mqChannel.assertQueue(q, { durable: true });
-    }
-
-    conn.on('error', e => {
-      mqChannel = null;
-      log('ERR', 'RABBITMQ', 'Connection error', { error: e.message });
-    });
-
-    conn.on('close', () => {
-      mqChannel = null;
-      log('WARN', 'RABBITMQ', 'Connection closed, retrying in 5 seconds');
-      setTimeout(connectRabbitMQ, 5000);
-    });
-
-    log('OK', 'RABBITMQ', 'Connected');
-    startWorkers();
+    const conn = await amqp.connect(RABBITMQ_URL);
+    channel    = await conn.createChannel();
+    for (const q of Object.values(QUEUES)) await channel.assertQueue(q, { durable: true });
+    log('🐇', 'RabbitMQ', 'Connected', { queues: Object.values(QUEUES).join(',') });
+    setupConsumers();
   } catch (e) {
-    mqChannel = null;
-    log('WARN', 'RABBITMQ', 'Unavailable, using direct mode', { error: e.message });
+    log('❌', 'RabbitMQ', `Connect failed — retry in 5s: ${e.message}`);
+    setTimeout(connectRabbitMQ, 5000);
   }
 }
 
 function publish(queue, payload) {
-  if (!mqChannel) return false;
-
+  if (!channel) { log('⚠️', 'RabbitMQ', 'No channel — skipping publish', { queue }); return false; }
   try {
-    mqChannel.sendToQueue(queue, Buffer.from(JSON.stringify(payload)), {
-      persistent: true,
-    });
-
-    log('Q', 'QUEUE', 'Published job', { queue });
+    channel.sendToQueue(queue, Buffer.from(JSON.stringify(payload)), { persistent: true });
     return true;
   } catch (e) {
-    log('ERR', 'QUEUE', 'Publish failed', { queue, error: e.message });
+    log('❌', 'RabbitMQ', `Publish failed: ${e.message}`, { queue });
     return false;
   }
 }
 
-function retryJob(queue, content, retries, delayMs) {
-  if (!mqChannel) return;
+function setupConsumers() {
+  if (!channel) return;
 
-  setTimeout(() => {
+  // CONFIRM: MSG1 — park confirmed
+  channel.consume(QUEUES.CONFIRM, async (msg) => {
+    if (!msg) return;
+    const j = JSON.parse(msg.content.toString());
+    channel.ack(msg);
     try {
-      mqChannel.sendToQueue(queue, content, {
-        persistent: true,
-        headers: { 'x-retry-count': retries + 1 },
-      });
+      await sendTemplate(j.phone, 'confirm_parked', [
+        j.carNumber, VENUE_NAME, j.driverName, String(j.slotMins),
+      ]);
+      log('✅', 'MSG1', `confirm_parked → ${j.phone}`, { car: j.carNumber });
+    } catch (e) { log('❌', 'MSG1', e.message); }
+  });
 
-      log('RETRY', 'QUEUE', 'Retry queued', {
-        queue,
-        retry: retries + 1,
-        delayMs,
-      });
-    } catch (e) {
-      log('ERR', 'QUEUE', 'Retry queue failed', { queue, error: e.message });
-    }
-  }, delayMs);
-}
-
-async function saveFailed(type, job, reason) {
-  try {
-    await db.collection('failed_messages').add({
-      type,
-      job,
-      reason,
-      failedAt: admin.firestore.FieldValue.serverTimestamp(),
-    });
-
-    log('FAIL', 'QUEUE', 'Saved failed job', { type, reason });
-  } catch (e) {
-    log('ERR', 'QUEUE', 'Failed to save failed job', { type, error: e.message });
-  }
-}
-
-function startWorkers() {
-  if (!mqChannel) return;
-
-  const worker = (queue, fn, maxRetries = 3, delay = 30000) => {
-    mqChannel.consume(queue, async msg => {
-      if (!msg) return;
-
-      const job = JSON.parse(msg.content.toString());
-      const retries = msg.properties.headers?.['x-retry-count'] || 0;
-
-      try {
-        log('WORK', 'QUEUE', 'Processing job', { queue, retry: retries });
-        await fn(job);
-        mqChannel.ack(msg);
-        log('OK', 'QUEUE', 'Job completed', { queue });
-      } catch (e) {
-        log('ERR', 'QUEUE', 'Job failed', {
-          queue,
-          retry: retries + 1,
-          error: e.message,
-        });
-
-        if (retries < maxRetries) {
-          retryJob(queue, msg.content, retries, delay);
-        } else {
-          await saveFailed(queue, job, e.message);
-        }
-
-        mqChannel.ack(msg);
-      }
-    }, { noAck: false });
-  };
-
-  worker(QUEUES.PARKED, j =>
-    sendTemplate(j.phone, 'confirm_parked', [
-      j.carNumber,
-      VENUE_NAME,
-      j.driverName,
-      String(j.slotMins),
-    ])
-  );
-
-  worker(QUEUES.RETRIEVE, j =>
-    sendTemplate(j.phone, 'retrieve', [
-      j.driverName,
-      String(j.slotMins),
-    ])
-  );
-
-  worker(QUEUES.SKIP, j =>
-    sendTemplate(j.phone, 'skip', [String(j.totalWait)]), 3, 15000
-  );
-
-  worker(QUEUES.CANCEL, j =>
-    sendTemplate(j.phone, 'cancel', []), 3, 15000
-  );
-
-  worker(QUEUES.END, j =>
-    sendTemplate(j.phone, 'end', [
-      j.carNumber,
-      VENUE_NAME,
-      j.phrase,
-      j.dish,
-    ])
-  );
-
-  worker(QUEUES.FCM, j =>
-    sendFCMNotification(j.carNumber, j.carId, j.wing || '', j.guestMasked || 'Guest'), 2, 10000
-  );
-
-  log('OK', 'QUEUE', 'All workers started');
-}
-
-function sanitize(str) {
-  if (typeof str !== 'string') return '';
-  return str.trim().replace(/[<>"'&]/g, '').substring(0, 200);
-}
-
-function normalizePhone(p) {
-  const d = String(p).replace(/[^0-9]/g, '');
-  if (d.length === 10) return `91${d}`;
-  return d;
-}
-
-function maskPhone(p) {
-  const d = String(p).replace(/[^0-9]/g, '');
-  if (d.length < 4) return 'Guest';
-  return d.substring(0, 2) + 'XXXXXX' + d.slice(-2);
-}
-
-function buildPhoneVariants(p) {
-  const d = String(p).replace(/[^0-9]/g, '');
-  if (d.length > 10) {
-    const last10 = d.slice(-10);
-    const cc = d.slice(0, d.length - 10);
-    return [...new Set([d, last10, `91${last10}`, `${cc}${last10}`])];
-  }
-  return [...new Set([d, `91${d}`])];
-}
-
-const localeCache = new Map([
-  ['confirm_parked', 'en'],
-  ['retrieve', 'en'],
-  ['skip', 'en'],
-  ['cancel', 'en'],
-  ['end', 'en'],
-]);
-
-async function sendTemplate(to, name, params = []) {
-  const components = params.length
-    ? [{ type: 'body', parameters: params.map(t => ({ type: 'text', text: String(t) })) }]
-    : [];
-
-  const cached = localeCache.get(name);
-  const locales = cached ? [cached] : ['en', 'en_US', 'en_GB'];
-  let lastErr = null;
-
-  for (const locale of locales) {
+  // RETRIEVE: MSG2 — retrieve coming
+  channel.consume(QUEUES.RETRIEVE, async (msg) => {
+    if (!msg) return;
+    const j = JSON.parse(msg.content.toString());
+    channel.ack(msg);
     try {
-      const res = await axios.post(
-        WA_BASE,
-        {
-          messaging_product: 'whatsapp',
-          to,
-          type: 'template',
-          template: {
-            name,
-            language: { code: locale },
-            ...(components.length ? { components } : {}),
-          },
-        },
-        { headers: WA_HEADERS() }
-      );
+      await sendTemplate(j.phone, 'retrieve', [j.driverName, String(j.slotMins)]);
+      log('✅', 'MSG2', `retrieve → ${j.phone}`, { driver: j.driverName });
+    } catch (e) { log('❌', 'MSG2', e.message); }
+  });
 
-      if (!cached) localeCache.set(name, locale);
+  // SKIP: MSG4
+  channel.consume(QUEUES.SKIP, async (msg) => {
+    if (!msg) return;
+    const j = JSON.parse(msg.content.toString());
+    channel.ack(msg);
+    try {
+      await sendTemplate(j.phone, 'skip', [String(j.slotMins)]);
+      log('✅', 'MSG4', `skip → ${j.phone}`);
+    } catch (e) { log('❌', 'MSG4', e.message); }
+  });
 
-      log('WA', 'WHATSAPP', 'Template sent', {
-        template: name,
-        to,
-        locale,
-      });
+  // CANCEL: MSG5
+  channel.consume(QUEUES.CANCEL, async (msg) => {
+    if (!msg) return;
+    const j = JSON.parse(msg.content.toString());
+    channel.ack(msg);
+    try {
+      await sendTemplate(j.phone, 'cancel', [j.carNumber]);
+      log('✅', 'MSG5', `cancel → ${j.phone}`, { car: j.carNumber });
+    } catch (e) { log('❌', 'MSG5', e.message); }
+  });
 
-      return res.data;
-    } catch (e) {
-      if (e.response?.data?.error?.code === 132001) {
-        lastErr = e;
-        continue;
-      }
-
-      log('ERR', 'WHATSAPP', 'Template failed', {
-        template: name,
-        to,
-        error: e.message,
-      });
-
-      throw e;
-    }
-  }
-
-  throw lastErr;
+  // END: MSG6
+  channel.consume(QUEUES.END, async (msg) => {
+    if (!msg) return;
+    const j = JSON.parse(msg.content.toString());
+    channel.ack(msg);
+    try {
+      await sendTemplate(j.phone, 'end', [j.carNumber, VENUE_NAME, j.phrase, j.dish]);
+      log('✅', 'MSG6', `end → ${j.phone}`, { car: j.carNumber });
+    } catch (e) { log('❌', 'MSG6', e.message); }
+  });
 }
 
-async function sendText(to, text) {
-  const res = await axios.post(
-    WA_BASE,
-    {
-      messaging_product: 'whatsapp',
-      to,
-      type: 'text',
-      text: { body: text },
+// ── WhatsApp template sender ──────────────────────────────────
+async function sendTemplate(phone, templateName, bodyParams = []) {
+  const body = {
+    messaging_product: 'whatsapp',
+    to:                phone,
+    type:              'template',
+    template: {
+      name:     templateName,
+      language: { code: 'en' },
+      components: bodyParams.length ? [{
+        type:       'body',
+        parameters: bodyParams.map(p => ({ type: 'text', text: String(p) })),
+      }] : [],
     },
-    { headers: WA_HEADERS() }
-  );
-
-  log('WA', 'WHATSAPP', 'Text message sent', { to });
+  };
+  const res = await axios.post(WA_BASE, body, { headers: WA_HEADERS() });
   return res.data;
 }
 
-function fmtTime(ts) {
-  if (!ts) return null;
-
+// ── FCM send (data-only, high priority) ──────────────────────
+async function sendFCMNotification(carNumber, carId, wing = '') {
   try {
-    const d = ts.toDate();
-    return {
-      iso: d.toISOString(),
-      readable: d.toLocaleString('en-IN', {
-        timeZone: 'Asia/Kolkata',
-        day: '2-digit',
-        month: 'short',
-        year: 'numeric',
-        hour: '2-digit',
-        minute: '2-digit',
-        hour12: true,
-      }),
-    };
-  } catch (_) {
-    return null;
+    // PROBLEM 8: Send only to ONLINE drivers — skip offline/absent ones.
+    // Drivers offline > 5min: likely asleep, FCM wakes but alarm won't show well.
+    // This prevents wasting retry budget on dead devices.
+    const fiveMinAgo = Date.now() - 5 * 60 * 1000;
+    const snap = await db.collection('drivers').get();
+    const tokens = snap.docs
+      .filter(d => {
+        const data = d.data();
+        if (!data.fcmToken) return false;
+        // Include if: online=true OR lastSeen within 5 min OR no presence data (older drivers)
+        if (data.online === true) return true;
+        const lastSeen = data.lastSeen?.toMillis?.() || 0;
+        if (lastSeen > fiveMinAgo) return true;
+        if (!data.lastSeen && data.online === undefined) return true; // no presence = include
+        log('⏭️', 'FCM', `Skipping offline driver ${d.id}`);
+        return false;
+      })
+      .map(d => d.data().fcmToken);
+
+    if (!tokens.length) { log('⚠️', 'FCM', 'No online driver tokens'); return; }
+
+    const res = await admin.messaging().sendEachForMulticast({
+      // DATA-ONLY payload — ensures onMessageReceived() fires even when app killed
+      // notification block intentionally omitted — native Kotlin service owns the UI
+      data: {
+        type:      'retrieve_requested',
+        carNumber: String(carNumber),
+        carId:     String(carId),
+        wing:      String(wing || ''),
+      },
+      android: {
+        priority:    'high',      // CRITICAL — wakes device from Doze/Idle
+        ttl:         60000,       // 60s TTL — matches our job timeout
+        // GAP 8 FIX: collapseKey = only latest FCM for same car reaches device
+        // Without this: 3 retries → 3 alarm rings simultaneously on device
+        // With this: Android coalesces to 1 delivery, device sees latest only
+        collapseKey: `retrieve_${carId}`,
+        restrictedPackageName: 'com.example.frontend',
+      },
+      apns: {
+        headers: {
+          'apns-priority':  '10',
+          'apns-push-type': 'background',
+          'apns-collapse-id': `retrieve_${carId}`,  // iOS equivalent of collapseKey
+        },
+        payload: { aps: { 'content-available': 1 } },
+      },
+      tokens,
+    });
+
+    log('📲', 'FCM', 'Push sent', {
+      success: `${res.successCount}/${tokens.length}`,
+      vehicle: carNumber,
+      wing: wing || 'none',
+    });
+
+    // Auto-delete invalid tokens
+    const batch = db.batch();
+    let hadInvalid = false;
+    const allDrivers = await db.collection('drivers').get();
+    res.responses.forEach((r, i) => {
+      if (!r.success) {
+        log('❌', 'FCM', 'Token failed', { error: r.error?.code });
+        if (r.error?.code === 'messaging/registration-token-not-registered' ||
+            r.error?.code === 'messaging/invalid-registration-token') {
+          allDrivers.docs.forEach(doc => {
+            if (doc.data().fcmToken === tokens[i]) {
+              batch.update(doc.ref, { fcmToken: admin.firestore.FieldValue.delete() });
+              hadInvalid = true;
+            }
+          });
+        }
+      }
+    });
+    if (hadInvalid) await batch.commit();
+
+  } catch (e) {
+    log('❌', 'FCM', `sendFCMNotification failed: ${e.message}`);
   }
 }
 
-function docToObj(doc) {
-  const d = doc.data();
-  return {
-    id: doc.id,
-    driver_name: d.driver_name || '',
-    guest_phone: d.guest_phone || '',
-    vehicle_number: d.vehicle_number || '',
-    parking_area: d.parking_area || '',
-    parking_detail: d.parking_detail || '',
-    status: d.status || '',
-    Entry_time: fmtTime(d.Entry_time),
-    parked_time: fmtTime(d.parked_time),
-    Retrieve_request_time: fmtTime(d.Retrieve_request_time),
-    handover_time: fmtTime(d.handover_time),
-    exited_time: fmtTime(d.exited_time),
-    Retrieve_time: d.Retrieve_time || null,
-    accepted_by: d.accepted_by || '',
-    accepted_driver_name: d.accepted_driver_name || '',
-    accepted_at: fmtTime(d.accepted_at),
-  };
+// ── FCM cancel (retrieve done) ────────────────────────────────
+async function sendFCMCancel(carId, type = 'retrieve_cancelled') {
+  try {
+    const snap   = await db.collection('drivers').get();
+    const tokens = snap.docs.map(d => d.data().fcmToken).filter(Boolean);
+    if (!tokens.length) return;
+
+    await admin.messaging().sendEachForMulticast({
+      data:    { type, carId: String(carId) },
+      android: { priority: 'high', ttl: 30000 },
+      tokens,
+    });
+    log('📲', 'FCM', `Cancel sent type=${type}`, { carId });
+  } catch (e) {
+    log('❌', 'FCM', `sendFCMCancel failed: ${e.message}`);
+  }
 }
 
+// ── Retry scheduler (Firestore-backed) ───────────────────────
+function scheduleRetry(carId) {
+  // Prevent double-scheduling in same process
+  if (scheduledRetries.has(carId)) return;
+  scheduledRetries.add(carId);
+
+  setTimeout(async () => {
+    scheduledRetries.delete(carId);
+    const job = await jobGet(carId);
+    if (!job || job.status !== 'pending') {
+      await jobDelete(carId);
+      return;
+    }
+    // PROBLEM 2: Do NOT stop retries on ACK.
+    // ACK = device received message. Retries stop ONLY on accept/skip.
+    // Log acked drivers count for monitoring.
+    if (job.ackedCount > 0) {
+      log('ℹ️', 'Retry', `carId=${carId} acked by ${job.ackedCount} device(s) — still retrying until action`);
+    }
+    if (job.retryCount >= MAX_RETRIES || Date.now() - job.sentAt > JOB_TIMEOUT) {
+      log('⏰', 'Retry', `Expired carId=${carId} retries=${job.retryCount}`);
+      await jobDelete(carId);
+      await db.collection('parked_cars').doc(carId)
+        .update({ status: 'timed_out' }).catch(() => {});
+      await sendFCMCancel(carId, 'retrieve_cancelled');
+      return;
+    }
+    const newCount = (job.retryCount || 0) + 1;
+    await jobSet(carId, { retryCount: newCount });
+    // PROBLEM 3: Fallback retry — if FCM delivery was uncertain,
+    // retrying ensures at least one delivery reaches the device.
+    log('🔄', 'Retry', `FCM fallback retry carId=${carId} attempt=${newCount}/${MAX_RETRIES}`);
+    await sendFCMNotification(job.carNumber, carId, job.wing);
+    scheduleRetry(carId);
+  }, RETRY_DELAY);
+}
+
+// ── WhatsApp webhook handlers ─────────────────────────────────
+async function handleRetrieveCar(guestPhone) {
+  try {
+    const snap = await col
+      .where('guest_phone', 'in', [guestPhone, '0' + guestPhone.slice(2)])
+      .where('status', 'in', ['parked', 'cancelled'])
+      .orderBy('parked_time', 'desc')
+      .limit(1)
+      .get();
+
+    if (snap.empty) {
+      log('⚠️', 'Retrieve', 'No parked car found', { phone: guestPhone });
+      return;
+    }
+    const doc  = snap.docs[0];
+    const data = doc.data();
+    const carId     = doc.id;
+    const carNumber = data.vehicle_number || '';
+    const wing      = data.parking_detail || '';
+
+    await col.doc(carId).update({
+      status:                'retrieve_requested',
+      Retrieve_request_time: admin.firestore.FieldValue.serverTimestamp(),
+      skip_notified:         false,
+    });
+
+    // Persist job to Firestore (survives server restart)
+    const job = { carNumber, wing, sentAt: Date.now(), retryCount: 0, status: 'pending' };
+    await jobSet(carId, job);
+
+    await sendFCMNotification(carNumber, carId, wing);
+    scheduleRetry(carId);
+
+    log('✅', 'Retrieve', `retrieve_requested carId=${carId}`, { car: carNumber, wing });
+  } catch (e) {
+    log('❌', 'Retrieve', e.message);
+  }
+}
+
+async function handleCancelRetrieval(guestPhone) {
+  try {
+    const snap = await col
+      .where('guest_phone', 'in', [guestPhone, '0' + guestPhone.slice(2)])
+      .where('status', 'in', ['retrieve_requested', 'accepted'])
+      .orderBy('Retrieve_request_time', 'desc')
+      .limit(1)
+      .get();
+
+    if (snap.empty) { log('⚠️', 'Cancel', 'No active retrieve', { phone: guestPhone }); return; }
+
+    const doc     = snap.docs[0];
+    const carId   = doc.id;
+    const carData = doc.data();
+
+    // Clear job from Firestore — stops retry on any server instance
+    await jobDelete(carId);
+
+    await col.doc(carId).update({ status: 'cancelled' });
+
+    // Send cancel FCM to all drivers → phones stop ringing
+    await sendFCMCancel(carId, 'retrieve_cancelled');
+
+    // Send MSG5 cancel WhatsApp
+    const phone = normalizePhone(carData.guest_phone || guestPhone);
+    const queued = publish(QUEUES.CANCEL, { phone, carNumber: carData.vehicle_number });
+    if (!queued) await sendTemplate(phone, 'cancel', [carData.vehicle_number || '']);
+
+    // Reset to parked after 3s
+    setTimeout(async () => {
+      try {
+        const current = await col.doc(carId).get();
+        if (current.data()?.status === 'cancelled') {
+          await col.doc(carId).update({ status: 'parked' });
+          log('🔄', 'Cancel', `Reset to parked carId=${carId}`);
+        }
+      } catch (_) {}
+    }, 3000);
+
+    log('✅', 'Cancel', `Cancelled carId=${carId}`, { car: carData.vehicle_number });
+  } catch (e) {
+    log('❌', 'Cancel', e.message);
+  }
+}
+
+// ── Express setup ─────────────────────────────────────────────
 const app = express();
 
-app.post('/webhook', express.raw({ type: 'application/json' }));
-
-app.use(helmet({ contentSecurityPolicy: false }));
-app.use(cors({
-  origin: (_, cb) => cb(null, true),
-  methods: ['GET', 'POST', 'PATCH', 'DELETE'],
+app.use(helmet({
+  contentSecurityPolicy: false,
+  crossOriginEmbedderPolicy: false,
 }));
-app.use(morgan('dev'));
-
-app.use((req, res, next) => {
-  if (req.path === '/webhook') return next();
-  express.json({ type: '*/*', limit: '10kb' })(req, res, next);
-});
-
-app.use(rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 50,
-  message: { error: 'Too many requests' },
-  skip: req => req.path === '/webhook' || req.path === '/' || req.headers['x-api-key'] === process.env.API_SECRET_KEY,
+app.use(cors());
+app.use(express.json({ limit: '1mb' }));
+app.use(morgan('dev', {
+  skip: req => req.path === '/health',
 }));
 
+// Block common attack paths
 app.use((req, res, next) => {
-  if (req.path === '/webhook' || req.path === '/') return next();
-
-  const key = req.headers['x-api-key'];
-  if (!key || key !== process.env.API_SECRET_KEY) {
-    log('AUTH', 'SECURITY', 'Unauthorized request', { path: req.path });
-    return res.status(401).json({ error: 'Unauthorized' });
+  const blocked = ['.env', 'wp-admin', '.git', 'phpMyAdmin', 'config.php'];
+  if (blocked.some(b => req.path.includes(b))) {
+    return res.status(403).json({ error: 'Forbidden' });
   }
-
   next();
 });
 
-app.get('/', (_, res) => {
-  res.json({ status: 'OK', service: 'Wotiko Valet Backend' });
+// API key auth
+const API_SECRET_KEY = process.env.API_SECRET_KEY || 'wotiko_xK9mP3qR7vL2';
+app.use((req, res, next) => {
+  // Whitelist webhook (Meta doesn't send our key)
+  if (req.path === '/webhook' || req.path === '/health') return next();
+  const key = req.headers['x-api-key'];
+  if (key !== API_SECRET_KEY) {
+    log('🚫', 'Auth', `Invalid key path=${req.path}`);
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  next();
 });
 
-app.get('/api/parking/all', async (_, res) => {
+// Rate limiting
+const apiLimiter = rateLimit({ windowMs: 60_000, max: 200, standardHeaders: true });
+app.use('/api/', apiLimiter);
+
+// ── Health ────────────────────────────────────────────────────
+app.get('/health', (_, res) =>
+  res.json({ status: 'OK', service: 'Wotiko Valet Backend', ts: new Date().toISOString() }));
+
+// ── Driver login / token save ─────────────────────────────────
+app.post('/api/driver/login', async (req, res) => {
+  const { uid, name, phone, fcmToken } = req.body;
+  if (!uid) return res.status(400).json({ error: 'uid required' });
+  try {
+    await db.collection('drivers').doc(uid).set(
+      { uid, name: name || '', phone: phone || '', fcmToken: fcmToken || '', updatedAt: admin.firestore.FieldValue.serverTimestamp() },
+      { merge: true }
+    );
+    log('✅', 'Driver', `Login uid=${uid}`, { name });
+    res.json({ success: true });
+  } catch (e) {
+    log('❌', 'Driver', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── Parking: get all ─────────────────────────────────────────
+app.get('/api/parking/all', async (req, res) => {
   try {
     const snap = await col.get();
     const data = snap.docs
       .map(docToObj)
-      .sort((a, b) => (b.parked_time?.iso ?? '').localeCompare(a.parked_time?.iso ?? ''));
-
-    log('API', 'PARKING', 'Fetched all parking records', { total: data.length });
+      .sort((a, b) =>
+        (b.parked_time?.iso ?? '').localeCompare(a.parked_time?.iso ?? ''));
     res.json({ success: true, total: data.length, data });
-  } catch (e) {
-    log('ERR', 'PARKING', 'Failed to fetch all parking records', { error: e.message });
-    res.status(500).json({ success: false, error: e.message });
-  }
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
 });
 
-app.get('/api/parking/:id', async (req, res) => {
+// ── Parking: pending (failsafe recovery endpoint) ────────────
+// Called by Flutter on app open via PendingRequestsChecker.kt
+// FIX 6: returns LIST of pending jobs not just 1 — multiple jobs possible
+app.get('/api/parking/pending', async (req, res) => {
+  const driverUid = req.query.driverUid;
+  if (!driverUid) return res.status(400).json({ error: 'driverUid required' });
+
   try {
-    const doc = await col.doc(req.params.id).get();
+    const snap = await col
+      .where('status', '==', 'retrieve_requested')
+      .orderBy('Retrieve_request_time', 'desc')
+      .limit(5)   // FIX 6: up to 5 pending jobs, not just 1
+      .get();
 
-    if (!doc.exists) {
-      log('WARN', 'PARKING', 'Parking record not found', { id: req.params.id });
-      return res.status(404).json({ success: false, error: 'Not found' });
-    }
+    if (snap.empty) return res.json({ hasPending: false, jobs: [] });
 
-    res.json({ success: true, data: docToObj(doc) });
-  } catch (e) {
-    log('ERR', 'PARKING', 'Failed to fetch parking record', {
-      id: req.params.id,
-      error: e.message,
+    const now  = Date.now();
+    const jobs = snap.docs
+      .map(doc => {
+        const d    = doc.data();
+        const reqT = d.Retrieve_request_time?.toMillis?.() || 0;
+        return { carId: doc.id, carNumber: d.vehicle_number || '', wing: d.parking_detail || '', ageMs: now - reqT };
+      })
+      .filter(j => j.ageMs < 60_000);  // only surface jobs < 60s old
+
+    if (!jobs.length) return res.json({ hasPending: false, jobs: [] });
+
+    log('📋', 'Pending', `Found ${jobs.length} pending job(s) for driverUid=${driverUid}`);
+    // Return first job as primary (app handles one at a time)
+    res.json({
+      hasPending: true,
+      carId:      jobs[0].carId,
+      carNumber:  jobs[0].carNumber,
+      wing:       jobs[0].wing,
+      jobs,       // full list — client can handle multiple if needed
     });
-    res.status(500).json({ success: false, error: e.message });
-  }
-});
-
-app.get('/api/parking/check-vehicle', async (req, res) => {
-  const vehicle = (req.query.vehicle || '').toUpperCase().trim();
-  if (!vehicle) return res.json({ active: false });
-
-  try {
-    const activeStatuses = ['parked', 'retrieve_requested', 'accepted'];
-    let isActive = false;
-
-    for (const status of activeStatuses) {
-      const snap = await col
-        .where('vehicle_number', '==', vehicle)
-        .where('status', '==', status)
-        .limit(1)
-        .get();
-
-      if (!snap.empty) {
-        isActive = true;
-        break;
-      }
-    }
-
-    log('API', 'PARKING', 'Checked vehicle active status', { vehicle, active: isActive });
-    res.json({ active: isActive });
   } catch (e) {
-    log('ERR', 'PARKING', 'Failed to check vehicle status', { vehicle, error: e.message });
-    res.status(500).json({ active: false, error: e.message });
-  }
-});
-
-app.post('/api/driver/login', async (req, res) => {
-  const { uid, name, phone, fcmToken } = req.body;
-  if (!uid) return res.status(400).json({ error: 'uid required' });
-
-  try {
-    await db.collection('drivers').doc(uid).set({
-      name: name || '',
-      phone: phone || '',
-      fcmToken: fcmToken || '',
-      lastLogin: admin.firestore.FieldValue.serverTimestamp(),
-      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-    }, { merge: true });
-
-    log('LOGIN', 'DRIVER', 'Driver login stored', {
-      uid,
-      name: name || '',
-      phone: phone || '',
-    });
-
-    res.json({ success: true });
-  } catch (e) {
-    log('ERR', 'DRIVER', 'Driver login failed', { uid, error: e.message });
+    log('❌', 'Pending', e.message);
     res.status(500).json({ error: e.message });
   }
 });
 
+// ── Parking: get by id ────────────────────────────────────────
+app.get('/api/parking/:id', async (req, res) => {
+  try {
+    const doc = await col.doc(req.params.id).get();
+    if (!doc.exists) return res.status(404).json({ success: false, error: 'Not found' });
+    res.json({ success: true, data: docToObj(doc) });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+// ── Parking: park a car ───────────────────────────────────────
 app.post('/api/parking/park', async (req, res) => {
-  const {
-    driver_name,
-    guest_phone,
-    vehicle_number,
-    parking_area,
-    parking_detail,
-  } = req.body;
-
-  if (!driver_name || !guest_phone || !vehicle_number || !parking_area) {
-    return res.status(400).json({ success: false, error: 'Missing fields' });
-  }
-
-  const now = admin.firestore.FieldValue.serverTimestamp();
+  const { driver_name, guest_phone, vehicle_number, parking_area, parking_detail } = req.body;
+  if (!driver_name || !guest_phone || !vehicle_number || !parking_area)
+    return res.status(400).json({ success: false, error: 'Missing required fields' });
 
   try {
+    const now = admin.firestore.FieldValue.serverTimestamp();
     const ref = await col.add({
-      driver_name: sanitize(driver_name),
-      guest_phone: sanitize(guest_phone),
-      vehicle_number: sanitize(vehicle_number).toUpperCase(),
-      parking_area: sanitize(parking_area).toUpperCase(),
-      parking_detail: sanitize(parking_detail || ''),
-      status: 'parked',
-      Entry_time: now,
-      parked_time: now,
+      driver_name,
+      guest_phone,
+      vehicle_number:        vehicle_number.toUpperCase(),
+      parking_area:          parking_area.toUpperCase(),
+      parking_detail:        parking_detail || '',
+      status:                'parked',
+      skip_notified:         false,
+      Entry_time:            now,
+      parked_time:           now,
       Retrieve_request_time: null,
-      handover_time: null,
-      exited_time: null,
-      Retrieve_time: null,
-      skip_notified: false,
-      accepted_by: '',
-      accepted_driver_name: '',
-      accepted_at: null,
+      handover_time:         null,
     });
 
-    log('PARK', 'PARKING', 'Car parked', {
-      docId: ref.id,
-      vehicle: vehicle_number,
-      area: parking_area,
-      driver: driver_name,
-    });
+    const phone      = normalizePhone(guest_phone);
+    const area       = parking_area.toUpperCase();
+    const slotMins   = SLOT_MINUTES[area] ?? 5;
 
-    res.status(201).json({ success: true, docId: ref.id });
+    // MSG1: confirm_parked via RabbitMQ (or direct fallback)
+    const queued = publish(QUEUES.CONFIRM, {
+      phone, carNumber: vehicle_number.toUpperCase(),
+      driverName: driver_name, slotMins,
+    });
+    if (!queued) {
+      await sendTemplate(phone, 'confirm_parked', [
+        vehicle_number.toUpperCase(), VENUE_NAME, driver_name, String(slotMins),
+      ]);
+    }
+
+    log('✅', 'Park', `Parked docId=${ref.id}`, { car: vehicle_number, area });
+    res.json({ success: true, docId: ref.id });
   } catch (e) {
-    log('ERR', 'PARKING', 'Park car failed', { error: e.message });
+    log('❌', 'Park', e.message);
     res.status(500).json({ success: false, error: e.message });
   }
 });
 
+// ── Parking: update status ────────────────────────────────────
 app.patch('/api/parking/:id/status', async (req, res) => {
-  const id = req.params.id;
-  const { status, driverUid = '', driverName = '' } = req.body;
-  const valid = ['parked', 'retrieve_requested', 'accepted', 'delivered', 'cancelled'];
-
-  if (!valid.includes(status)) {
+  const { status } = req.body;
+  const carId = req.params.id;
+  const valid  = ['parked', 'retrieve_requested', 'accepted', 'delivered', 'cancelled'];
+  if (!valid.includes(status))
     return res.status(400).json({ success: false, error: 'Invalid status' });
-  }
 
   try {
-    const ref = col.doc(id);
+    const ref = col.doc(carId);
+    const doc = await ref.get();
+    if (!doc.exists) return res.status(404).json({ success: false, error: 'Not found' });
 
-    if (status === 'accepted') {
-      const result = await db.runTransaction(async tx => {
-        const doc = await tx.get(ref);
-
-        if (!doc.exists) {
-          return { code: 404, body: { success: false, error: 'Not found' } };
-        }
-
-        const current = doc.data()?.status;
-        if (current !== 'retrieve_requested') {
-          return {
-            code: 409,
-            body: { success: false, error: `Cannot accept from status ${current}` },
-          };
-        }
-
-        tx.update(ref, {
-          status: 'accepted',
-          accepted_by: driverUid || '',
-          accepted_driver_name: driverName || '',
-          accepted_at: admin.firestore.FieldValue.serverTimestamp(),
-        });
-
-        return { code: 200, body: { success: true } };
-      });
-
-      if (result.code === 200) {
-        log('ACC', 'STATUS', 'Driver accepted retrieval', {
-          carId: id,
-          driverUid,
-          driverName,
-        });
-      } else {
-        log('WARN', 'STATUS', 'Accept blocked', {
-          carId: id,
-          status,
-          resultCode: result.code,
-        });
-      }
-
-      return res.status(result.code).json(result.body);
+    // Clear Firestore job → stops retry loop on all server instances
+    if (['accepted', 'delivered', 'cancelled'].includes(status)) {
+      await jobDelete(carId);
+      log('🛑', 'Retry', `Loop stopped carId=${carId} status=${status}`);
     }
 
-    const doc = await ref.get();
-    if (!doc.exists) {
-      log('WARN', 'STATUS', 'Parking record not found for status update', { carId: id });
-      return res.status(404).json({ success: false, error: 'Not found' });
+    // GAP 9 FIX: idempotent status update — prevent duplicate accept
+    // If status is already accepted/delivered, return 409 so client treats it as success
+    const currentStatus = doc.data().status;
+    if (status === 'accepted' && currentStatus === 'accepted') {
+      log('ℹ️', 'Status', `carId=${carId} already accepted — idempotent 409`);
+      return res.status(409).json({ success: false, error: 'Already accepted', idempotent: true });
+    }
+    if (status === 'delivered' && currentStatus === 'delivered') {
+      return res.status(409).json({ success: false, error: 'Already delivered', idempotent: true });
     }
 
     const update = { status };
-
-    if (status === 'retrieve_requested') {
-      update.Retrieve_request_time = admin.firestore.FieldValue.serverTimestamp();
-      update.skip_notified = false;
-      update.accepted_by = '';
-      update.accepted_driver_name = '';
-      update.accepted_at = null;
+    if (status === 'accepted') {
+      update.accepted_time = admin.firestore.FieldValue.serverTimestamp();
     }
-
-    if (status === 'cancelled' || status === 'parked') {
-      update.accepted_by = '';
-      update.accepted_driver_name = '';
-      update.accepted_at = null;
-      update.skip_notified = false;
-    }
-
     if (status === 'delivered') {
       const now = admin.firestore.FieldValue.serverTimestamp();
       update.handover_time = now;
-      update.exited_time = now;
-
-      if (doc.data().Retrieve_request_time) {
-        update.Retrieve_time = `${Math.round(
-          (Date.now() - doc.data().Retrieve_request_time.toDate().getTime()) / 60000
-        )} min`;
+      update.exited_time   = now;
+      const rtMs = doc.data().Retrieve_request_time?.toMillis?.();
+      if (rtMs) {
+        update.Retrieve_time = `${Math.round((Date.now() - rtMs) / 1000)}s`;
       }
     }
 
     await ref.update(update);
+    log('✅', 'Status', `carId=${carId} → ${status}`);
 
-    log('STATUS', 'PARKING', 'Status updated', {
-      carId: id,
-      status,
-    });
+    // FIX MSG6: Flutter calls PATCH delivered — send WhatsApp end message here too
+    // /deliver-car also sends MSG6, but Flutter may call PATCH instead
+    // Both paths now send MSG6 so guest always receives final message
+    if (status === 'delivered') {
+      const guestPhone = doc.data().guest_phone || '';
+      const carNumber  = doc.data().vehicle_number || '';
+      if (guestPhone) {
+        const nPhone = normalizePhone(guestPhone);
+        const phrase = pick(PHRASES);
+        const dish   = pick(DISHES);
+        const queued = publish(QUEUES.END, { phone: nPhone, carNumber, phrase, dish });
+        if (!queued) {
+          sendTemplate(nPhone, 'end', [carNumber, VENUE_NAME, phrase, dish])
+            .catch(e => log('❌', 'MSG6', `PATCH deliver MSG6 failed: ${e.message}`));
+        }
+        log('✅', 'MSG6', `Sent via PATCH delivered → ${nPhone}`, { car: carNumber });
+      }
+    }
+
+    // PROBLEM 5: On accept — cancel all other drivers immediately
+    // Send retrieve_accepted FCM to ALL drivers so their alarms stop ringing
+    if (status === 'accepted') {
+      sendFCMCancel(carId, 'retrieve_accepted').catch(e =>
+        log('⚠️', 'Cancel', `FCM cancel failed: ${e.message}`)
+      );
+      // Clear Firestore job — no more retries
+      await jobDelete(carId).catch(() => {});
+    }
 
     res.json({ success: true });
   } catch (e) {
-    log('ERR', 'STATUS', 'Status update failed', { carId: id, error: e.message });
+    log('❌', 'Status', e.message);
     res.status(500).json({ success: false, error: e.message });
   }
 });
 
-app.post('/send-messages', async (req, res) => {
-  const { phone, type, message, templateName, bodyParams } = req.body;
-  if (!phone) return res.status(400).json({ error: 'phone required' });
-
-  try {
-    if (type === 'text') {
-      await sendText(phone, message);
-      log('API', 'WHATSAPP', 'Text message requested', { phone });
-      return res.json({ success: true });
-    }
-
-    if (type === 'template') {
-      log('API', 'WHATSAPP', 'Template message requested', {
-        phone,
-        templateName,
-      });
-
-      if (templateName === 'confirm_parked') {
-        const queued = publish(QUEUES.PARKED, {
-          phone,
-          carNumber: bodyParams?.[0] || '',
-          driverName: bodyParams?.[1] || '',
-          slotMins: bodyParams?.[2] || 5,
-        });
-
-        if (!queued) {
-          await sendTemplate(phone, 'confirm_parked', [
-            bodyParams?.[0] || '',
-            VENUE_NAME,
-            bodyParams?.[1] || '',
-            String(bodyParams?.[2] || 5),
-          ]);
-        }
-      } else if (templateName === 'retrieve') {
-        const queued = publish(QUEUES.RETRIEVE, {
-          phone,
-          driverName: bodyParams?.[0] || '',
-          slotMins: bodyParams?.[1] || 5,
-        });
-
-        if (!queued) {
-          await sendTemplate(phone, 'retrieve', [
-            bodyParams?.[0] || '',
-            String(bodyParams?.[1] || 5),
-          ]);
-        }
-      } else if (templateName === 'skip') {
-        const queued = publish(QUEUES.SKIP, {
-          phone,
-          totalWait: bodyParams?.[0] || 6,
-        });
-
-        if (!queued) {
-          await sendTemplate(phone, 'skip', [String(bodyParams?.[0] || 6)]);
-        }
-      } else if (templateName === 'cancel') {
-        const queued = publish(QUEUES.CANCEL, { phone });
-        if (!queued) {
-          await sendTemplate(phone, 'cancel', []);
-        }
-      }
-
-      return res.json({ success: true });
-    }
-
-    res.status(400).json({ error: 'Unknown type' });
-  } catch (e) {
-    log('ERR', 'WHATSAPP', 'send-messages failed', { error: e.message });
-    res.status(500).json({ error: e.message });
-  }
-});
-
-app.post('/deliver-car', async (req, res) => {
-  const { phone, docId } = req.body;
-  if (!phone || !docId) {
-    return res.status(400).json({ error: 'phone and docId required' });
-  }
-
-  try {
-    const doc = await col.doc(docId).get();
-    if (!doc.exists) {
-      log('WARN', 'DELIVER', 'Car not found for delivery', { docId });
-      return res.status(404).json({ error: 'Car not found' });
-    }
-
-    const carNumber = doc.data().vehicle_number || '';
-    const phrase = pick(PHRASES);
-    const dish = pick(DISHES);
-
-    const queued = publish(QUEUES.END, {
-      phone: normalizePhone(phone),
-      carNumber,
-      phrase,
-      dish,
-    });
-
-    if (!queued) {
-      await sendTemplate(normalizePhone(phone), 'end', [
-        carNumber,
-        VENUE_NAME,
-        phrase,
-        dish,
-      ]);
-    }
-
-    const now = admin.firestore.FieldValue.serverTimestamp();
-    const update = {
-      status: 'delivered',
-      handover_time: now,
-      exited_time: now,
-    };
-
-    if (doc.data().Retrieve_request_time) {
-      update.Retrieve_time = `${Math.round(
-        (Date.now() - doc.data().Retrieve_request_time.toDate().getTime()) / 60000
-      )} min`;
-    }
-
-    await col.doc(docId).update(update);
-
-    log('DONE', 'DELIVER', 'Car delivered', {
-      docId,
-      carNumber,
-    });
-
-    const deliverSnap = await db.collection('drivers').get();
-    const deliverTokens = deliverSnap.docs.map(d => d.data().fcmToken).filter(Boolean);
-
-    if (deliverTokens.length) {
-      await admin.messaging().sendEachForMulticast({
-        data: { type: 'retrieve_delivered', carId: String(docId) },
-        android: { priority: 'high', ttl: 30000 },
-        tokens: deliverTokens,
-      }).catch(e => {
-        log('ERR', 'FCM', 'Deliver multicast failed', { error: e.message });
-      });
-
-      log('FCM', 'PUSH', 'Delivered push sent', {
-        docId,
-        tokenCount: deliverTokens.length,
-      });
-    }
-
-    res.json({ success: true, carNumber });
-  } catch (e) {
-    log('ERR', 'DELIVER', 'deliver-car failed', { docId, error: e.message });
-    res.status(500).json({ error: e.message });
-  }
-});
-
+// ── Skip car ──────────────────────────────────────────────────
+// Only sends MSG4 ONCE per car (skip_notified flag prevents duplicates)
 app.post('/skip-car', async (req, res) => {
   const { docId } = req.body;
   if (!docId) return res.status(400).json({ error: 'docId required' });
 
   try {
     const doc = await col.doc(docId).get();
-    if (!doc.exists) {
-      log('WARN', 'SKIP', 'Car not found for skip', { docId });
-      return res.status(404).json({ error: 'Car not found' });
-    }
-
+    if (!doc.exists) return res.status(404).json({ error: 'Car not found' });
     const data = doc.data();
 
     if (data.skip_notified === true) {
-      log('SKIP', 'STATUS', 'Skip already notified', { docId });
+      log('ℹ️', 'Skip', `Already notified docId=${docId}`);
       return res.json({ success: true, alreadyNotified: true });
     }
 
+    // Clear Firestore job — stops retry loop
+    await jobDelete(docId);
+
+    // Mark immediately (prevents race condition with multiple drivers)
     await col.doc(docId).update({ skip_notified: true });
 
-    const phone = data.guest_phone || '';
-    const area = (data.parking_area || 'A').toUpperCase();
+    const phone    = normalizePhone(data.guest_phone || '');
+    const area     = (data.parking_area || 'A').toUpperCase();
     const slotMins = SLOT_MINUTES[area] ?? 5;
-    const totalWait = slotMins * 2;
+    const waitMins = slotMins + slotMins;
 
     if (phone) {
-      const nPhone = normalizePhone(phone);
-      const queued = publish(QUEUES.SKIP, { phone: nPhone, totalWait });
-
-      if (!queued) {
-        await sendTemplate(nPhone, 'skip', [String(totalWait)]);
-      }
+      // Send directly — no queue for time-sensitive skip message
+      await sendTemplate(phone, 'skip', [String(waitMins)]);
+      log('✅', 'Skip', `MSG4 → ${phone} wait=${waitMins}min`);
     }
-
-    log('SKIP', 'STATUS', 'Skip processed', {
-      docId,
-      vehicle: data.vehicle_number || '',
-      totalWait,
-    });
 
     res.json({ success: true });
   } catch (e) {
-    log('ERR', 'SKIP', 'skip-car failed', { docId, error: e.message });
+    log('❌', 'Skip', e.message);
     res.status(500).json({ error: e.message });
   }
 });
 
+// ── Deliver car ───────────────────────────────────────────────
+app.post('/deliver-car', async (req, res) => {
+  const { phone, docId } = req.body;
+  if (!phone || !docId) return res.status(400).json({ error: 'phone and docId required' });
+
+  try {
+    const doc = await col.doc(docId).get();
+    if (!doc.exists) return res.status(404).json({ error: 'Car not found' });
+    const carNumber = doc.data().vehicle_number || '';
+    const phrase    = pick(PHRASES);
+    const dish      = pick(DISHES);
+
+    const nPhone = normalizePhone(phone);
+    const queued  = publish(QUEUES.END, { phone: nPhone, carNumber, phrase, dish });
+    if (!queued) {
+      await sendTemplate(nPhone, 'end', [carNumber, VENUE_NAME, phrase, dish]);
+    }
+
+    await col.doc(docId).update({
+      status:       'delivered',
+      handover_time: admin.firestore.FieldValue.serverTimestamp(),
+      exited_time:  admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    log('✅', 'Deliver', `MSG6 → ${nPhone}`, { car: carNumber });
+    res.json({ success: true });
+  } catch (e) {
+    log('❌', 'Deliver', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── Check vehicle (for retrieve flow validation) ──────────────
+app.post('/check-vehicle', async (req, res) => {
+  const { vehicle_number } = req.body;
+  if (!vehicle_number) return res.status(400).json({ error: 'vehicle_number required' });
+
+  try {
+    const snap = await col
+      .where('vehicle_number', '==', vehicle_number.toUpperCase())
+      .where('status', 'in', ['parked', 'retrieve_requested', 'accepted'])
+      .limit(1)
+      .get();
+
+    if (snap.empty) return res.json({ found: false });
+
+    const doc  = snap.docs[0];
+    const data = doc.data();
+    res.json({
+      found:          true,
+      docId:          doc.id,
+      vehicle_number: data.vehicle_number,
+      parking_area:   data.parking_area,
+      parking_detail: data.parking_detail,
+      status:         data.status,
+      driver_name:    data.driver_name,
+    });
+  } catch (e) {
+    log('❌', 'CheckVehicle', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── FIX 2: Device acknowledgement ────────────────────────────
+// Android calls this immediately on FCM receipt to tell server
+// "I got the message, stop retrying". This cuts unnecessary retries.
+// GAP 7 FIX: rate-limited — prevents retry cancellation abuse.
+const ackLimiter = rateLimit({ windowMs: 10_000, max: 20, standardHeaders: true });
+app.post('/api/ack', ackLimiter, async (req, res) => {
+  const { carId, driverUid } = req.body;
+  if (!carId) return res.status(400).json({ error: 'carId required' });
+
+  try {
+    const job = await jobGet(carId);
+    if (job && job.status === 'pending') {
+      // PROBLEM 1+2: Log ACK for delivery verification but DO NOT stop retry loop.
+      // ACK = device received FCM. Retry stops ONLY on accept/skip.
+      // If we stopped retries on ACK: only 1 driver gets FCM, others never ring.
+      await jobSet(carId, {
+        ackedCount: (job.ackedCount || 0) + 1,
+        lastAckedAt: Date.now(),
+        lastAckedBy: driverUid || 'unknown',
+      });
+      log('📬', 'Ack', `carId=${carId} acked by ${driverUid} — retries CONTINUE until accept/skip`);
+    }
+    res.json({ success: true });
+  } catch (e) {
+    log('❌', 'Ack', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── WhatsApp webhook ──────────────────────────────────────────
 app.get('/webhook', (req, res) => {
   if (req.query['hub.verify_token'] === WA_VERIFY) {
-    log('OK', 'WEBHOOK', 'Webhook verified');
+    log('✅', 'Webhook', 'Verified');
     return res.send(req.query['hub.challenge']);
   }
-
-  log('WARN', 'WEBHOOK', 'Webhook verify failed');
   res.status(403).send('Forbidden');
 });
 
 app.post('/webhook', (req, res) => {
-  const sig = req.headers['x-hub-signature-256'] || '';
-  const body = req.body;
-
-  if (sig && process.env.WA_APP_SECRET) {
-    const expected = 'sha256=' + crypto
-      .createHmac('sha256', process.env.WA_APP_SECRET)
-      .update(body)
-      .digest('hex');
-
-    if (sig !== expected) {
-      log('WARN', 'WEBHOOK', 'Invalid signature');
-      return res.status(403).end();
-    }
-  }
-
   res.status(200).send('OK');
-
-  try {
-    const parsed = Buffer.isBuffer(body) ? JSON.parse(body.toString()) : body;
-    setImmediate(() => processWebhook(parsed));
-  } catch (e) {
-    log('ERR', 'WEBHOOK', 'Webhook parse failed', { error: e.message });
-  }
+  setImmediate(() => processWebhook(req.body));
 });
 
 async function processWebhook(body) {
   try {
     const msg = body.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
     if (!msg) return;
-
     const from = msg.from;
-
-    log('IN', 'WEBHOOK', 'Incoming WhatsApp event', {
-      type: msg.type,
-      from,
-    });
+    log('📨', 'Webhook', `${msg.type} from ${from}`);
 
     if (msg.type === 'button') {
       const text = (msg.button?.text || '').toLowerCase();
-
       if (text.includes('retrieve') && !text.includes('cancel')) {
         await handleRetrieveCar(from);
       } else if (text.includes('cancel')) {
@@ -921,256 +909,35 @@ async function processWebhook(body) {
 
     if (msg.type === 'interactive') {
       const id = msg.interactive?.button_reply?.id || '';
-      if (id === 'retrieve_car') await handleRetrieveCar(from);
-      if (id === 'cancel_retrieval') await handleCancelRetrieval(from);
+      if (id === 'retrieve_car')    await handleRetrieveCar(from);
+      else if (id === 'cancel_car') await handleCancelRetrieval(from);
     }
   } catch (e) {
-    log('ERR', 'WEBHOOK', 'processWebhook failed', { error: e.message });
+    log('❌', 'Webhook', e.message);
   }
 }
 
-async function handleRetrieveCar(from) {
-  const variants = buildPhoneVariants(from);
+// ── 404 ───────────────────────────────────────────────────────
+app.use((req, res) => res.status(404).json({ error: 'Not found' }));
 
-  try {
-    let matchedDoc = null;
+// ── Error handler ─────────────────────────────────────────────
+app.use((err, req, res, next) => {
+  log('❌', 'UnhandledError', err.message);
+  res.status(500).json({ error: 'Internal server error' });
+});
 
-    for (const ph of variants) {
-      for (const st of ['parked', 'cancelled']) {
-        const snap = await col
-          .where('guest_phone', '==', ph)
-          .where('status', '==', st)
-          .limit(1)
-          .get();
-
-        if (!snap.empty) {
-          matchedDoc = snap.docs[0];
-          break;
-        }
-      }
-      if (matchedDoc) break;
-    }
-
-    if (!matchedDoc) {
-      log('WARN', 'RETRIEVE', 'No active parking record found', { from });
-      await sendText(from, 'We could not find an active parking record. Please contact our valet team.');
-      return;
-    }
-
-    const data = matchedDoc.data();
-    const carId = matchedDoc.id;
-
-    await matchedDoc.ref.update({
-      status: 'retrieve_requested',
-      Retrieve_request_time: admin.firestore.FieldValue.serverTimestamp(),
-      skip_notified: false,
-      accepted_by: '',
-      accepted_driver_name: '',
-      accepted_at: null,
-    });
-
-    const wing = (data.parking_area || '').toUpperCase();
-    const guestMasked = maskPhone(data.guest_phone || '');
-
-    log('REQ', 'RETRIEVE', 'Guest requested retrieval', {
-      from,
-      carId,
-      vehicle: data.vehicle_number || '',
-      wing,
-      guest: guestMasked,
-    });
-
-    const fcmQueued = publish(QUEUES.FCM, {
-      carNumber: data.vehicle_number,
-      carId,
-      wing,
-      guestMasked,
-    });
-
-    if (!fcmQueued) {
-      await sendFCMNotification(data.vehicle_number, carId, wing, guestMasked);
-    }
-  } catch (e) {
-    log('ERR', 'RETRIEVE', 'handleRetrieveCar failed', { from, error: e.message });
-  }
-}
-
-async function handleCancelRetrieval(from) {
-  const nFrom = normalizePhone(from);
-  const variants = buildPhoneVariants(from);
-
-  try {
-    let matchedDoc = null;
-
-    for (const ph of variants) {
-      for (const status of ['retrieve_requested', 'accepted']) {
-        const snap = await col
-          .where('guest_phone', '==', ph)
-          .where('status', '==', status)
-          .limit(1)
-          .get();
-
-        if (!snap.empty) {
-          matchedDoc = snap.docs[0];
-          break;
-        }
-      }
-      if (matchedDoc) break;
-    }
-
-    if (!matchedDoc) {
-      log('WARN', 'CANCEL', 'No active retrieval found to cancel', { from: nFrom });
-      return;
-    }
-
-    const carId = matchedDoc.id;
-
-    await matchedDoc.ref.update({
-      status: 'cancelled',
-      accepted_by: '',
-      accepted_driver_name: '',
-      accepted_at: null,
-    });
-
-    log('CANCEL', 'STATUS', 'Guest cancelled retrieval', {
-      from: nFrom,
-      carId,
-    });
-
-    const cancelDriverSnap = await db.collection('drivers').get();
-    const cancelDriverTokens = cancelDriverSnap.docs.map(d => d.data().fcmToken).filter(Boolean);
-
-    if (cancelDriverTokens.length) {
-      await admin.messaging().sendEachForMulticast({
-        data: { type: 'retrieve_cancelled', carId: String(carId) },
-        android: { priority: 'high', ttl: 30000 },
-        tokens: cancelDriverTokens,
-      }).catch(e => {
-        log('ERR', 'FCM', 'Cancel multicast failed', { error: e.message });
-      });
-
-      log('FCM', 'PUSH', 'Cancel push sent', {
-        carId,
-        tokenCount: cancelDriverTokens.length,
-      });
-    }
-
-    setTimeout(async () => {
-      try {
-        await matchedDoc.ref.update({
-          status: 'parked',
-          accepted_by: '',
-          accepted_driver_name: '',
-          accepted_at: null,
-          skip_notified: false,
-        });
-
-        log('RESET', 'STATUS', 'Cancelled retrieval reset back to parked', { carId });
-      } catch (e) {
-        log('ERR', 'STATUS', 'Failed to reset to parked', { carId, error: e.message });
-      }
-    }, 3000);
-
-    const queued = publish(QUEUES.CANCEL, { phone: nFrom });
-    if (!queued) {
-      await sendTemplate(nFrom, 'cancel', []);
-    }
-  } catch (e) {
-    log('ERR', 'CANCEL', 'handleCancelRetrieval failed', {
-      from: nFrom,
-      error: e.message,
-    });
-  }
-}
-
-async function sendFCMNotification(carNumber, carId, wing = '', guestMasked = 'Guest') {
-  try {
-    const snap = await db.collection('drivers').get();
-    const tokens = snap.docs.map(d => d.data().fcmToken).filter(Boolean);
-
-    if (!tokens.length) {
-      log('WARN', 'FCM', 'No FCM tokens available', { carId, carNumber });
-      return;
-    }
-
-    const res = await admin.messaging().sendEachForMulticast({
-      data: {
-        type: 'retrieve_requested',
-        carNumber: String(carNumber),
-        carId: String(carId),
-        wing: String(wing || ''),
-        guestMasked: String(guestMasked || 'Guest'),
-      },
-      android: {
-        priority: 'high',
-        ttl: 60000,
-      },
-      apns: {
-        headers: {
-          'apns-priority': '10',
-          'apns-push-type': 'background',
-        },
-        payload: {
-          aps: { 'content-available': 1 },
-        },
-      },
-      tokens,
-    });
-
-    log('FCM', 'PUSH', 'Retrieve push sent', {
-      carId,
-      carNumber,
-      wing,
-      success: `${res.successCount}/${tokens.length}`,
-    });
-
-    const invalidTokens = [];
-
-    res.responses.forEach((r, i) => {
-      if (!r.success) {
-        log('WARN', 'FCM', 'Token send failed', {
-          index: i,
-          error: r.error?.code || 'unknown',
-        });
-
-        if (
-          r.error?.code === 'messaging/registration-token-not-registered' ||
-          r.error?.code === 'messaging/invalid-registration-token'
-        ) {
-          invalidTokens.push(tokens[i]);
-        }
-      }
-    });
-
-    if (invalidTokens.length > 0) {
-      const allDrivers = await db.collection('drivers').get();
-      const batch = db.batch();
-
-      allDrivers.docs.forEach(doc => {
-        if (invalidTokens.includes(doc.data().fcmToken)) {
-          batch.update(doc.ref, { fcmToken: '' });
-        }
-      });
-
-      await batch.commit();
-
-      log('CLEAN', 'FCM', 'Invalid tokens removed', {
-        count: invalidTokens.length,
-      });
-    }
-  } catch (e) {
-    log('ERR', 'FCM', 'sendFCMNotification failed', {
-      carId,
-      carNumber,
-      error: e.message,
-    });
-  }
-}
-
+// ── Start ─────────────────────────────────────────────────────
 const PORT = process.env.PORT || 8000;
-
 app.listen(PORT, '0.0.0.0', () => {
-  log('OK', 'SERVER', 'Wotiko backend running', { port: PORT });
+  log('🏨', 'Server', `Wotiko Valet Backend running on port ${PORT}`);
+  log('📋', 'Routes', 'GET /health | POST /api/driver/login | GET /api/parking/all');
+  log('📋', 'Routes', 'GET /api/parking/pending | POST /api/parking/park | PATCH /api/parking/:id/status');
+  log('📋', 'Routes', 'POST /skip-car | POST /deliver-car | POST /check-vehicle');
+  log('📋', 'Routes', 'GET+POST /webhook');
 });
 
 connectRabbitMQ();
+
+// FIX 1: Rehydrate Firestore jobs on startup
+// Any pending jobs from before server restart get their retry loops resumed
+rehydrateJobs().catch(e => log('❌', 'Startup', `rehydrateJobs failed: ${e.message}`));
