@@ -1,38 +1,6 @@
 /**
  * server.js — Wotiko Valet Backend  (v2 — Queue Edition)
- *
- * ── What changed vs v1 ──────────────────────────────────────
- *  1. Express app wrapped in http.createServer() so Socket.IO shares the port.
- *  2. Three new module imports: queueManager, fcm, socket.
- *  3. handleRetrieveCar()  — builds driver queue, writes it to Firestore,
- *     calls assignNext() instead of broadcasting to all.
- *  4. PATCH /api/parking/:id/status  — "accepted" path uses handleAccept()
- *     transaction; returns 409 on conflict. All other statuses unchanged.
- *  5. POST /skip-car  — WhatsApp skip logic unchanged; additionally calls
- *     handleSkip() to advance the queue.
- *  6. POST /api/driver/login  — also sets isOnline + lastActive.
- *  7. POST /api/driver/heartbeat  — NEW lightweight endpoint.
- *  8. FCM in /deliver-car and handleCancelRetrieval() now uses module helpers.
- *  9. handleCancel() called on cancel to clear the backend timer.
- * 10. app.listen → httpServer.listen.
- *
- * ── What is IDENTICAL to v1 ──────────────────────────────────
- *  All other routes, helpers, RabbitMQ workers, WhatsApp flow,
- *  Firestore schema (new fields are purely additive).
- *
- * ── New Firestore fields on parked_cars (additive) ───────────
- *  driverQueue:        [{ uid, fcmToken, name }, ...]
- *  currentDriverIndex: number   (0-based, deleted on accept)
- *  assignedDriverUid:  string
- *  guestMasked:        string
- *
- * ── New Firestore fields on drivers (additive) ───────────────
- *  isOnline:   boolean
- *  lastActive: timestamp
- *
- * ── New composite index required ─────────────────────────────
- *  Collection: drivers
- *  Fields:     isOnline ASC, lastActive DESC
+ * ...
  */
 
 'use strict';
@@ -47,14 +15,12 @@ const amqp      = require('amqplib');
 const http      = require('http');
 require('dotenv').config();
 
-// ── New modules ───────────────────────────────────────────────
 const { initSocket }                               = require('./modules/socket');
 const { sendFCMToTokens, sendFCMToAllExcept,
         sendFCMAdapter }                            = require('./modules/fcm');
 const { buildDriverQueue, assignNext, handleSkip,
         handleAccept, handleCancel }                = require('./modules/queueManager');
 
-// ── Structured logger ─────────────────────────────────────────  [UNCHANGED]
 function log(emoji, category, message, meta = {}) {
   const ts   = new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', hour12: true });
   const metaStr = Object.keys(meta).length
@@ -84,7 +50,6 @@ const WA_HEADERS  = () => ({
   'Content-Type': 'application/json',
 });
 
-// ── Constants ─────────────────────────────────────────────────  [UNCHANGED]
 const VENUE_NAME   = 'Madras Square';
 const SLOT_MINUTES = { 'A': 2, 'B': 2, 'C': 3, 'D': 4, 'E': 5, 'OTHER': 6 };
 
@@ -107,7 +72,6 @@ const DISHES = [
 ];
 const pick = arr => arr[Math.floor(Math.random() * arr.length)];
 
-// ── RabbitMQ ──────────────────────────────────────────────────  [UNCHANGED]
 let mqChannel = null;
 const QUEUES = {
   PARKED:   'whatsapp.parked',
@@ -198,32 +162,23 @@ function startWorkers() {
     }, { noAck: false });
   };
 
-  // MSG1: confirm_parked
   worker(QUEUES.PARKED,   j => sendTemplate(j.phone, 'confirm_parked',
     [j.carNumber, VENUE_NAME, j.driverName, String(j.slotMins)]));
-  // MSG2: retrieve
   worker(QUEUES.RETRIEVE, j => sendTemplate(j.phone, 'retrieve',
     [j.driverName, String(j.slotMins)]));
-  // MSG4: skip
   worker(QUEUES.SKIP,     j => sendTemplate(j.phone, 'skip',
     [String(j.totalWait)]), 3, 15000);
-  // MSG5: cancel
   worker(QUEUES.CANCEL,   j => sendTemplate(j.phone, 'cancel', []), 3, 15000);
-  // MSG6: end
   worker(QUEUES.END,      j => sendTemplate(j.phone, 'end',
     [j.carNumber, VENUE_NAME, j.phrase, j.dish]));
-  // FCM push (legacy RabbitMQ worker — still used for RabbitMQ-queued FCM jobs)
   worker(QUEUES.FCM,      j => sendFCMNotification(j.carNumber, j.carId, j.wing || '', j.guestMasked || 'Guest'), 2, 10000);
 
   console.log('✅ All workers started');
 }
 
-// ── Express + HTTP server + Socket.IO ─────────────────────────
-// Only change from v1: wrap app in http.createServer so Socket.IO
-// can share the same port. app.use / routes are identical.
 const app        = express();
 const httpServer = http.createServer(app);
-const io         = initSocket(httpServer);          // ← Socket.IO attached here
+const io         = initSocket(httpServer);
 
 app.use(helmet({ contentSecurityPolicy: false }));
 app.use(cors({
@@ -270,7 +225,6 @@ app.use((req, res, next) => {
   next();
 });
 
-// ── Helpers ───────────────────────────────────────────────────  [UNCHANGED]
 function sanitize(str) {
   if (typeof str !== 'string') return '';
   return str.trim().replace(/[<>"'&]/g, '').substring(0, 200);
@@ -302,7 +256,7 @@ const localeCache = new Map([
   ['confirm_parked','en'],['retrieve','en'],['skip','en'],['cancel','en'],['end','en'],
 ]);
 
-async function sendTemplate(to, name, params = []) {        // [UNCHANGED]
+async function sendTemplate(to, name, params = []) {
   const components = params.length > 0
     ? [{ type: 'body', parameters: params.map(t => ({ type: 'text', text: String(t) })) }]
     : [];
@@ -333,14 +287,14 @@ async function sendTemplate(to, name, params = []) {        // [UNCHANGED]
   throw lastErr;
 }
 
-async function sendText(to, text) {                         // [UNCHANGED]
+async function sendText(to, text) {
   const res = await axios.post(WA_BASE,
     { messaging_product: 'whatsapp', to, type: 'text', text: { body: text } },
     { headers: WA_HEADERS() });
   return res.data;
 }
 
-function fmtTime(ts) {                                      // [UNCHANGED]
+function fmtTime(ts) {
   if (!ts) return null;
   try {
     const d = ts.toDate();
@@ -354,7 +308,7 @@ function fmtTime(ts) {                                      // [UNCHANGED]
   } catch (_) { return null; }
 }
 
-function docToObj(doc) {                                    // [UNCHANGED + assignedDriverUid]
+function docToObj(doc) {
   const d = doc.data();
   return {
     id:                    doc.id,
@@ -364,7 +318,7 @@ function docToObj(doc) {                                    // [UNCHANGED + assi
     parking_area:          d.parking_area       || '',
     parking_detail:        d.parking_detail     || '',
     status:                d.status             || '',
-    assignedDriverUid:     d.assignedDriverUid  || null,   // ← new field exposed
+    assignedDriverUid:     d.assignedDriverUid  || null,
     Entry_time:            fmtTime(d.Entry_time),
     parked_time:           fmtTime(d.parked_time),
     Retrieve_request_time: fmtTime(d.Retrieve_request_time),
@@ -374,14 +328,10 @@ function docToObj(doc) {                                    // [UNCHANGED + assi
   };
 }
 
-// ─────────────────────────────────────────────────────────────
-// ROUTES  — all v1 routes preserved exactly unless noted
-// ─────────────────────────────────────────────────────────────
-
 app.get('/', (_, res) =>
   res.json({ status: 'OK', service: 'Wotiko Valet Backend v2' }));
 
-app.get('/api/parking/all', async (req, res) => {           // [UNCHANGED]
+app.get('/api/parking/all', async (req, res) => {
   try {
     const snap = await col.get();
     const data = snap.docs
@@ -392,7 +342,7 @@ app.get('/api/parking/all', async (req, res) => {           // [UNCHANGED]
   } catch (e) { res.status(500).json({ success: false, error: e.message }); }
 });
 
-app.get('/api/parking/:id', async (req, res) => {           // [UNCHANGED]
+app.get('/api/parking/:id', async (req, res) => {
   try {
     const doc = await col.doc(req.params.id).get();
     if (!doc.exists) return res.status(404).json({ success: false, error: 'Not found' });
@@ -400,7 +350,7 @@ app.get('/api/parking/:id', async (req, res) => {           // [UNCHANGED]
   } catch (e) { res.status(500).json({ success: false, error: e.message }); }
 });
 
-app.get('/api/parking/check-vehicle', async (req, res) => { // [UNCHANGED]
+app.get('/api/parking/check-vehicle', async (req, res) => {
   const vehicle = (req.query.vehicle || '').toUpperCase().trim();
   if (!vehicle) return res.json({ active: false });
   try {
@@ -419,7 +369,6 @@ app.get('/api/parking/check-vehicle', async (req, res) => { // [UNCHANGED]
   }
 });
 
-// ── Driver login — CHANGE: also sets isOnline + lastActive ────
 app.post('/api/driver/login', async (req, res) => {
   const { uid, name, phone, fcmToken } = req.body;
   if (!uid) return res.status(400).json({ error: 'uid required' });
@@ -428,8 +377,8 @@ app.post('/api/driver/login', async (req, res) => {
       name:       name     || '',
       phone:      phone    || '',
       fcmToken:   fcmToken || '',
-      isOnline:   true,                                     // ← new
-      lastActive: admin.firestore.FieldValue.serverTimestamp(), // ← new
+      isOnline:   true,
+      lastActive: admin.firestore.FieldValue.serverTimestamp(),
       lastLogin:  admin.firestore.FieldValue.serverTimestamp(),
       updatedAt:  admin.firestore.FieldValue.serverTimestamp(),
     }, { merge: true });
@@ -441,8 +390,6 @@ app.post('/api/driver/login', async (req, res) => {
   }
 });
 
-// ── Driver heartbeat — NEW lightweight endpoint ───────────────
-// Flutter calls this every 30 s to keep lastActive fresh.
 app.post('/api/driver/heartbeat', async (req, res) => {
   const { uid } = req.body;
   if (!uid) return res.status(400).json({ error: 'uid required' });
@@ -455,7 +402,7 @@ app.post('/api/driver/heartbeat', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.post('/api/parking/park', async (req, res) => {         // [UNCHANGED]
+app.post('/api/parking/park', async (req, res) => {
   const { driver_name, guest_phone, vehicle_number, parking_area, parking_detail } = req.body;
   if (!driver_name || !guest_phone || !vehicle_number || !parking_area)
     return res.status(400).json({ success: false, error: 'Missing fields' });
@@ -483,8 +430,6 @@ app.post('/api/parking/park', async (req, res) => {         // [UNCHANGED]
   } catch (e) { res.status(500).json({ success: false, error: e.message }); }
 });
 
-// ── Update status — CHANGE: "accepted" uses handleAccept() ───
-// All other statuses: identical to v1.
 app.patch('/api/parking/:id/status', async (req, res) => {
   const { status, driverUid } = req.body;
   const carId = req.params.id;
@@ -494,7 +439,6 @@ app.patch('/api/parking/:id/status', async (req, res) => {
 
   try {
     if (status === 'accepted') {
-      // Transaction-guarded accept — prevents two drivers accepting simultaneously
       const uid    = driverUid || '';
       const result = await handleAccept(
         carId,
@@ -514,12 +458,10 @@ app.patch('/api/parking/:id/status', async (req, res) => {
       return res.json({ success: true });
     }
 
-    // ── All other status updates: byte-for-byte from v1 ───────
     const ref = col.doc(carId);
     const doc = await ref.get();
     if (!doc.exists) return res.status(404).json({ success: false, error: 'Not found' });
     const update = { status };
-    if (status === 'accepted') { /* already handled above */ }
     if (status === 'delivered') {
       const now = admin.firestore.FieldValue.serverTimestamp();
       update.handover_time = now;
@@ -535,7 +477,7 @@ app.patch('/api/parking/:id/status', async (req, res) => {
   } catch (e) { res.status(500).json({ success: false, error: e.message }); }
 });
 
-app.delete('/api/parking/:id', async (req, res) => {        // [UNCHANGED]
+app.delete('/api/parking/:id', async (req, res) => {
   try {
     const doc = await col.doc(req.params.id).get();
     if (!doc.exists) return res.status(404).json({ success: false, error: 'Not found' });
@@ -544,7 +486,7 @@ app.delete('/api/parking/:id', async (req, res) => {        // [UNCHANGED]
   } catch (e) { res.status(500).json({ success: false, error: e.message }); }
 });
 
-app.post('/send-messages', async (req, res) => {            // [UNCHANGED]
+app.post('/send-messages', async (req, res) => {
   const { phone, type, message, templateName, bodyParams } = req.body;
   if (!phone) return res.status(400).json({ error: 'phone required' });
   try {
@@ -584,7 +526,7 @@ app.post('/send-messages', async (req, res) => {            // [UNCHANGED]
   }
 });
 
-app.post('/deliver-car', async (req, res) => {              // [UNCHANGED logic, module FCM]
+app.post('/deliver-car', async (req, res) => {
   const { phone, docId } = req.body;
   if (!phone || !docId)
     return res.status(400).json({ error: 'phone and docId required' });
@@ -611,7 +553,6 @@ app.post('/deliver-car', async (req, res) => {              // [UNCHANGED logic,
     await col.doc(docId).update(update);
     console.log(`✅ Delivered | ${docId}`);
 
-    // FCM delivered to all drivers
     const deliverSnap   = await db.collection('drivers').get();
     const deliverTokens = deliverSnap.docs.map(d => d.data().fcmToken).filter(Boolean);
     if (deliverTokens.length) {
@@ -627,9 +568,6 @@ app.post('/deliver-car', async (req, res) => {              // [UNCHANGED logic,
   }
 });
 
-// ── Skip Car — CHANGE: calls handleSkip() after WA message ───
-// WhatsApp skip logic: identical to v1 (send once via skip_notified flag).
-// Queue logic: advance to next driver.
 app.post('/skip-car', async (req, res) => {
   const { docId } = req.body;
   if (!docId) return res.status(400).json({ error: 'docId required' });
@@ -638,7 +576,6 @@ app.post('/skip-car', async (req, res) => {
     if (!doc.exists) return res.status(404).json({ error: 'Car not found' });
     const data = doc.data();
 
-    // ── WhatsApp skip message (unchanged from v1) ─────────────
     if (data.skip_notified === true) {
       console.log(`⏭️ Skip already notified | ${docId}`);
     } else {
@@ -655,8 +592,6 @@ app.post('/skip-car', async (req, res) => {
       }
     }
 
-    // ── Queue: advance to next driver ─────────────────────────
-    // handleSkip() is transaction-guarded; safe to call from timeout ACK too.
     await handleSkip(docId, sendFCMAdapter, io);
 
     res.json({ success: true });
@@ -666,7 +601,6 @@ app.post('/skip-car', async (req, res) => {
   }
 });
 
-// ── Webhook verify ────────────────────────────────────────────  [UNCHANGED]
 app.get('/webhook', (req, res) => {
   if (req.query['hub.verify_token'] === WA_VERIFY) {
     console.log('✅ Webhook verified');
@@ -675,7 +609,6 @@ app.get('/webhook', (req, res) => {
   res.status(403).send('Forbidden');
 });
 
-// ── Webhook receive ───────────────────────────────────────────  [UNCHANGED]
 app.post('/webhook', express.raw({ type: 'application/json' }), (req, res) => {
   const sig  = req.headers['x-hub-signature-256'] || '';
   const body = req.body;
@@ -696,7 +629,7 @@ app.post('/webhook', express.raw({ type: 'application/json' }), (req, res) => {
   setImmediate(() => processWebhook(parsed));
 });
 
-async function processWebhook(body) {                       // [UNCHANGED]
+async function processWebhook(body) {
   try {
     const msg = body.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
     if (!msg) return;
@@ -716,9 +649,6 @@ async function processWebhook(body) {                       // [UNCHANGED]
   } catch (e) { console.error('💥 Webhook:', e.message); }
 }
 
-// ── Handle Retrieve Car — CHANGE: queue-based assignment ──────
-// Firestore update: identical to v1 + 4 additive queue fields.
-// FCM: changed from broadcast-all to assignNext() (one driver at a time).
 async function handleRetrieveCar(from) {
   console.log(`🚗 Retrieve: ${from}`);
   const variants = buildPhoneVariants(from);
@@ -747,7 +677,6 @@ async function handleRetrieveCar(from) {
     const wing        = (data.parking_area || '').toUpperCase();
     const guestMasked = maskPhone(data.guest_phone || '');
 
-    // Build queue of online drivers
     const queue = await buildDriverQueue();
 
     log('🔔', 'RETRIEVE', `Guest requesting car`, {
@@ -756,12 +685,11 @@ async function handleRetrieveCar(from) {
       queueLen: queue.length, docId: carId,
     });
 
-    // Firestore update — v1 fields unchanged, 4 additive queue fields added
     await matchedDoc.ref.update({
       status:                'retrieve_requested',
       Retrieve_request_time: admin.firestore.FieldValue.serverTimestamp(),
       skip_notified:         false,
-      // ── additive queue fields ──────────────────────────────
+      isExhausted:           false,
       guestMasked,
       driverQueue:           queue,
       currentDriverIndex:    0,
@@ -769,7 +697,6 @@ async function handleRetrieveCar(from) {
     });
 
     if (queue.length === 0) {
-      // No online drivers → immediate broadcast fallback (same as v1 behavior)
       log('⚠️', 'QUEUE', `No online drivers — broadcasting to all`, { carId });
       const fcmQueued = publish(QUEUES.FCM, {
         carNumber: data.vehicle_number, carId, wing, guestMasked,
@@ -778,14 +705,11 @@ async function handleRetrieveCar(from) {
       return;
     }
 
-    // Sequential assignment — one driver at a time
     await assignNext(carId, sendFCMAdapter, io);
 
   } catch (e) { console.error('❌ handleRetrieveCar:', e.message); }
 }
 
-// ── Handle Cancel Retrieval — CHANGE: clears backend timer ────
-// Logic: identical to v1. Added: handleCancel(carId) to clear the timer.
 async function handleCancelRetrieval(from) {
   console.log(`❌ Cancel: ${from}`);
   const nFrom    = normalizePhone(from);
@@ -810,13 +734,11 @@ async function handleCancelRetrieval(from) {
 
     const carId = matchedDoc.id;
 
-    // Cancel the backend assignment timer immediately
-    handleCancel(carId);                                    // ← new
+    handleCancel(carId);
 
     await matchedDoc.ref.update({ status: 'cancelled' });
     log('❌', 'CANCEL', `Guest cancelled retrieval`, { docId: carId });
 
-    // FCM cancel to all drivers (unchanged)
     const cancelDriverSnap   = await db.collection('drivers').get();
     const cancelDriverTokens = cancelDriverSnap.docs.map(d => d.data().fcmToken).filter(Boolean);
     if (cancelDriverTokens.length) {
@@ -825,10 +747,8 @@ async function handleCancelRetrieval(from) {
       console.log(`✅ Cancel FCM → ${cancelDriverTokens.length} drivers`);
     }
 
-    // Socket.IO broadcast
-    io.to('drivers').emit('request_cancelled', { carId });  // ← new
+    io.to('drivers').emit('request_cancelled', { carId });
 
-    // Reset to parked after 3 s (unchanged)
     setTimeout(async () => {
       try {
         await matchedDoc.ref.update({ status: 'parked' });
@@ -836,7 +756,6 @@ async function handleCancelRetrieval(from) {
       } catch (e) { console.error('❌ Reset parked:', e.message); }
     }, 3000);
 
-    // MSG5 cancel to guest (unchanged)
     const queued = publish(QUEUES.CANCEL, { phone: nFrom });
     if (!queued) await sendTemplate(nFrom, 'cancel', []);
     console.log(`✅ MSG5 cancel → ${nFrom}`);
@@ -844,8 +763,6 @@ async function handleCancelRetrieval(from) {
   } catch (e) { console.error('❌ handleCancelRetrieval:', e.message); }
 }
 
-// ── sendFCMNotification — UNCHANGED ──────────────────────────
-// Kept for: RabbitMQ FCM worker + fallback when no drivers online.
 async function sendFCMNotification(carNumber, carId, wing = '', guestMasked = 'Guest') {
   try {
     const snap   = await db.collection('drivers').get();
@@ -878,9 +795,6 @@ async function sendFCMNotification(carNumber, carId, wing = '', guestMasked = 'G
   } catch (e) { console.error('❌ FCM:', e.message); }
 }
 
-// ─────────────────────────────────────────────────────────────
-// START — httpServer instead of app so Socket.IO shares the port
-// ─────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 8000;
 httpServer.listen(PORT, '0.0.0.0', () => {
   console.log(`\n🏨 Wotiko Valet Backend v2 | Port ${PORT}`);
