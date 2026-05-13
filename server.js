@@ -50,27 +50,8 @@ const WA_HEADERS  = () => ({
   'Content-Type': 'application/json',
 });
 
-const VENUE_NAME   = 'Madras Square';
+const VENUE_NAME   = 'Creativano';
 const SLOT_MINUTES = { 'A': 2, 'B': 2, 'C': 3, 'D': 4, 'E': 5, 'OTHER': 6 };
-
-const PHRASES = [
-  "Wotiko's vote is with",
-  'Team Wotiko is crazy about',
-  'Wotiko was wowed by',
-  'Yummm! Team Wotiko loved',
-  'Wotiko Team is still dreaming about',
-  'The regulars here love',
-  "This week's fave dish was",
-  'Tira miss it already! That and',
-];
-const DISHES = [
-  'Truffle Garlic Fried Rice',
-  'Curry Butter Garlic Prawns',
-  'Dragon Chicken',
-  'Chicken Quesadillas',
-  'Pan Grilled Salmon',
-];
-const pick = arr => arr[Math.floor(Math.random() * arr.length)];
 
 let mqChannel = null;
 const QUEUES = {
@@ -169,8 +150,7 @@ function startWorkers() {
   worker(QUEUES.SKIP,     j => sendTemplate(j.phone, 'skip',
     [String(j.totalWait)]), 3, 15000);
   worker(QUEUES.CANCEL,   j => sendTemplate(j.phone, 'cancel', []), 3, 15000);
-  worker(QUEUES.END,      j => sendTemplate(j.phone, 'end',
-    [j.carNumber, VENUE_NAME, j.phrase, j.dish]));
+  worker(QUEUES.END,      j => sendTemplate(j.phone, 'test_end', []));
   worker(QUEUES.FCM,      j => sendFCMNotification(j.carNumber, j.carId, j.wing || '', j.guestMasked || 'Guest'), 2, 10000);
 
   console.log('✅ All workers started');
@@ -253,7 +233,7 @@ function buildPhoneVariants(p) {
 }
 
 const localeCache = new Map([
-  ['confirm_parked','en'],['retrieve','en'],['skip','en'],['cancel','en'],['end','en'],
+  ['confirm_parked','en'],['retrieve','en'],['skip','en'],['cancel','en'],['test_end','en'],
 ]);
 
 async function sendTemplate(to, name, params = []) {
@@ -534,14 +514,12 @@ app.post('/deliver-car', async (req, res) => {
     const doc = await col.doc(docId).get();
     if (!doc.exists) return res.status(404).json({ error: 'Car not found' });
     const carNumber = doc.data().vehicle_number || '';
-    const phrase    = pick(PHRASES);
-    const dish      = pick(DISHES);
 
-    const queued = publish(QUEUES.END, { phone: normalizePhone(phone), carNumber, phrase, dish });
+    const queued = publish(QUEUES.END, { phone: normalizePhone(phone) });
     if (!queued) {
-      await sendTemplate(normalizePhone(phone), 'end', [carNumber, VENUE_NAME, phrase, dish]);
+      await sendTemplate(normalizePhone(phone), 'test_end', []);
     }
-    log('✅', 'DELIVER', `Car delivered`, { vehicle: carNumber, phrase: phrase.substring(0,20), dish });
+    log('✅', 'DELIVER', `Car delivered`, { vehicle: carNumber });
 
     const now    = admin.firestore.FieldValue.serverTimestamp();
     const update = { status: 'delivered', handover_time: now, exited_time: now };
@@ -800,7 +778,7 @@ httpServer.listen(PORT, '0.0.0.0', () => {
   console.log(`\n🏨 Wotiko Valet Backend v2 | Port ${PORT}`);
   console.log(`🚦 Queue: sequential assignment → skip/timeout → next → broadcast fallback`);
   console.log(`🔌 Socket.IO: real-time delivery when app is open`);
-  console.log(`📲 MSG1:confirm_parked MSG2:retrieve MSG4:skip MSG5:cancel MSG6:end`);
+  console.log(`📲 MSG1:confirm_parked MSG2:retrieve MSG4:skip MSG5:cancel MSG6:test_end`);
   console.log(`🔗 Webhook: RetrieveCar→Queue | CancelRetrieval→cancelled→parked(3s)\n`);
 });
 
