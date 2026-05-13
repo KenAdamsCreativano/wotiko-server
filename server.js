@@ -150,7 +150,7 @@ function startWorkers() {
   worker(QUEUES.SKIP,     j => sendTemplate(j.phone, 'skip',
     [String(j.totalWait)]), 3, 15000);
   worker(QUEUES.CANCEL,   j => sendTemplate(j.phone, 'cancel', []), 3, 15000);
-  worker(QUEUES.END,      j => sendTemplate(j.phone, 'test_end', []));
+  worker(QUEUES.END,      j => sendTemplate(j.phone, 'test_end', [j.carNumber]));
   worker(QUEUES.FCM,      j => sendFCMNotification(j.carNumber, j.carId, j.wing || '', j.guestMasked || 'Guest'), 2, 10000);
 
   console.log('✅ All workers started');
@@ -515,9 +515,9 @@ app.post('/deliver-car', async (req, res) => {
     if (!doc.exists) return res.status(404).json({ error: 'Car not found' });
     const carNumber = doc.data().vehicle_number || '';
 
-    const queued = publish(QUEUES.END, { phone: normalizePhone(phone) });
+    const queued = publish(QUEUES.END, { phone: normalizePhone(phone), carNumber });
     if (!queued) {
-      await sendTemplate(normalizePhone(phone), 'test_end', []);
+      await sendTemplate(normalizePhone(phone), 'test_end', [carNumber]);
     }
     log('✅', 'DELIVER', `Car delivered`, { vehicle: carNumber });
 
