@@ -51,7 +51,7 @@ const WA_HEADERS  = () => ({
 });
 
 const VENUE_NAME   = 'Creativano';
-const SLOT_MINUTES = { 'A': 2, 'B': 2, 'C': 3, 'D': 4, 'E': 5, 'OTHER': 6 };
+const SLOT_MINUTES = { 'A': 5, 'B': 5, 'C': 5, 'D': 5, 'E': 5, 'OTHER': 5 };
 
 let mqChannel = null;
 const QUEUES = {
